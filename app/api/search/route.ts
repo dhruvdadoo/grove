@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { parseQuery, rerankPlaces, type ParsedQuery } from "@/lib/claude";
 import { fetchRedditForQuery, buildRedditContext } from "@/lib/reddit";
 import { fetchHawkerCentres, getRelevantHawkerCentres, hawkerToRestaurant } from "@/lib/nea";
-import { fetchFoodBlogPosts, buildBlogContext } from "@/lib/foodblogs";
 import { getCached, setCached } from "@/lib/cache";
 import { logSearch } from "@/lib/analytics";
 
@@ -33,6 +32,7 @@ interface PlaceResult {
   websiteUri?: string;
   reservable?: boolean;
   dineIn?: boolean;
+  photos?: Array<{ name: string; widthPx?: number; heightPx?: number }>;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -42,7 +42,6 @@ const SINGAPORE_BOUNDS = {
   high: { latitude: 1.4784, longitude: 104.0120 },
 };
 
-// Expanding radius steps (metres) for GPS-based searches
 const GPS_RADII = [1000, 2000, 5000, 10000, 20000];
 const MIN_RESULTS = 5;
 
@@ -63,6 +62,7 @@ const FIELD_MASK = [
   "places.websiteUri",
   "places.reservable",
   "places.dineIn",
+  "places.photos",
 ].join(",");
 
 const CUISINE_MAP: Record<string, string> = {
@@ -139,8 +139,6 @@ async function fetchMapsPlaces(
   userLat?: number,
   userLng?: number
 ): Promise<PlaceResult[]> {
-  // Key passed as query param — header-based auth (X-Goog-Api-Key) is rejected
-  // when the key has HTTP-referrer restrictions, query param works universally.
   const mapsUrl = `https://places.googleapis.com/v1/places:searchText?key=${apiKey}`;
   const headers = {
     "Content-Type":     "application/json",
@@ -148,8 +146,6 @@ async function fetchMapsPlaces(
   };
 
   if (userLat !== undefined && userLng !== undefined) {
-    // GPS available: try expanding radius until ≥ MIN_RESULTS
-    // NOTE: locationRestriction only accepts rectangle; circles must use locationBias
     for (const radius of GPS_RADII) {
       console.log(`[grove] Maps search radius: ${radius}m, query: "${textQuery}"`);
       const res = await fetch(mapsUrl, {
@@ -180,7 +176,6 @@ async function fetchMapsPlaces(
     }
     return [];
   } else {
-    // No GPS: use Singapore rectangle bounds
     const res = await fetch(mapsUrl, {
       method: "POST",
       headers,
@@ -201,7 +196,7 @@ async function fetchMapsPlaces(
   }
 }
 
-// ─── Other helpers ────────────────────────────────────────────────────────────
+// ─── Opening hours helpers ─────────────────────────────────────────────────────
 
 function formatHour(h: number, m: number): string {
   const period = h >= 12 ? "pm" : "am";
@@ -209,45 +204,150 @@ function formatHour(h: number, m: number): string {
   return m === 0 ? `${h12}${period}` : `${h12}:${String(m).padStart(2, "0")}${period}`;
 }
 
-function getClosingTime(hours?: OpeningHours): string {
-  if (!hours) return "hours unknown";
+interface HoursInfo {
+  isOpen: boolean;
+  closingTime: string;
+  opensNextAt?: string;
+  hoursDisplay: string;
+  todaySessions: Array<{ open: string; close: string }>;
+}
+
+function buildHoursInfo(hours?: OpeningHours): HoursInfo {
+  const openNow = hours?.openNow ?? true;
+
+  if (!hours) {
+    return { isOpen: openNow, closingTime: "hours unknown", hoursDisplay: "Hours unknown", todaySessions: [] };
+  }
+
   if (hours.periods?.length) {
     const now    = new Date();
     const today  = now.getDay();
     const nowMin = now.getHours() * 60 + now.getMinutes();
-    for (const p of hours.periods) {
-      if (p.open.day !== today || !p.close) continue;
-      const openMin  = p.open.hour  * 60 + (p.open.minute  ?? 0);
-      const closeMin = p.close.hour * 60 + (p.close.minute ?? 0);
-      if (nowMin >= openMin && nowMin < closeMin)
-        return formatHour(p.close.hour, p.close.minute ?? 0);
-    }
+
+    // Periods that open today; may close overnight (close.day = tomorrow)
     const todayPeriods = hours.periods
       .filter((p) => p.open.day === today && p.close)
       .sort((a, b) =>
-        (a.close!.hour * 60 + (a.close!.minute ?? 0)) -
-        (b.close!.hour * 60 + (b.close!.minute ?? 0))
+        (a.open.hour * 60 + (a.open.minute ?? 0)) -
+        (b.open.hour * 60 + (b.open.minute ?? 0))
       );
-    if (todayPeriods.length > 0) {
-      const last = todayPeriods.at(-1)!;
-      return formatHour(last.close!.hour, last.close!.minute ?? 0);
+
+    // Also include yesterday's overnight periods that are still open today
+    const yesterday = (today + 6) % 7;
+    const overnightPeriods = hours.periods.filter(
+      (p) => p.open.day === yesterday && p.close && p.close.day === today
+    );
+
+    if (todayPeriods.length === 0 && overnightPeriods.length === 0) {
+      return { isOpen: false, closingTime: "closed today", hoursDisplay: "Closed today", todaySessions: [] };
     }
+
+    // Build normalised sessions with minute-of-day values
+    type Session = { open: string; close: string; openMin: number; closeMin: number };
+    const sessions: Session[] = [];
+
+    for (const p of overnightPeriods) {
+      if (!p.close) continue;
+      sessions.push({
+        open:     formatHour(p.open.hour, p.open.minute ?? 0),
+        close:    formatHour(p.close.hour, p.close.minute ?? 0),
+        openMin:  -(1440 - (p.open.hour * 60 + (p.open.minute ?? 0))),
+        closeMin: p.close.hour * 60 + (p.close.minute ?? 0),
+      });
+    }
+
+    for (const p of todayPeriods) {
+      if (!p.close) continue;
+      const closeMin =
+        p.close.day === today
+          ? p.close.hour * 60 + (p.close.minute ?? 0)
+          : 1440 + p.close.hour * 60 + (p.close.minute ?? 0); // closes tomorrow
+      sessions.push({
+        open:     formatHour(p.open.hour, p.open.minute ?? 0),
+        close:    formatHour(p.close.hour, p.close.minute ?? 0),
+        openMin:  p.open.hour * 60 + (p.open.minute ?? 0),
+        closeMin,
+      });
+    }
+
+    sessions.sort((a, b) => a.openMin - b.openMin);
+
+    // Find which session we're currently in
+    let currentSession: Session | null = null;
+    let opensNextAt: string | undefined;
+
+    for (const s of sessions) {
+      if (nowMin >= s.openMin && nowMin < s.closeMin) {
+        currentSession = s;
+        break;
+      }
+    }
+
+    // If not in any session, find next opening time today
+    if (!currentSession) {
+      for (const s of sessions) {
+        if (s.openMin > nowMin) {
+          opensNextAt = s.open;
+          break;
+        }
+      }
+    }
+
+    const isActuallyOpen = currentSession !== null || (openNow && sessions.length > 0);
+    const displaySessions = sessions.map((s) => ({ open: s.open, close: s.close }));
+
+    // Build human-readable hours display
+    let hoursDisplay: string;
+    if (displaySessions.length === 1) {
+      const s = displaySessions[0];
+      if (isActuallyOpen) {
+        hoursDisplay = `Open · Closes ${s.close}`;
+      } else if (opensNextAt) {
+        hoursDisplay = `Closed · Opens ${opensNextAt}`;
+      } else {
+        hoursDisplay = `${s.open}–${s.close}`;
+      }
+    } else if (displaySessions.length === 2) {
+      const s0 = sessions[0];
+      const s1 = sessions[1];
+      // Label as Lunch/Dinner when timing looks like it
+      const isLunchDinner = s0.openMin >= 10 * 60 && s0.openMin <= 13 * 60 && s1.openMin >= 17 * 60;
+      const parts = isLunchDinner
+        ? [`Lunch ${displaySessions[0].open}–${displaySessions[0].close}`, `Dinner ${displaySessions[1].open}–${displaySessions[1].close}`]
+        : [`${displaySessions[0].open}–${displaySessions[0].close}`, `${displaySessions[1].open}–${displaySessions[1].close}`];
+      hoursDisplay = parts.join(" · ");
+      if (!isActuallyOpen && opensNextAt) {
+        hoursDisplay += ` (Opens ${opensNextAt})`;
+      }
+    } else {
+      hoursDisplay = displaySessions.map((s) => `${s.open}–${s.close}`).join(" · ");
+    }
+
+    const closingTime = currentSession
+      ? currentSession.close
+      : displaySessions[displaySessions.length - 1]?.close ?? "varies";
+
+    return { isOpen: isActuallyOpen, closingTime, opensNextAt, hoursDisplay, todaySessions: displaySessions };
   }
+
+  // Weekday descriptions fallback
   if (hours.weekdayDescriptions?.length) {
     const jsDay  = new Date().getDay();
     const apiIdx = jsDay === 0 ? 6 : jsDay - 1;
     const desc   = hours.weekdayDescriptions[apiIdx] ?? "";
-    const m      = desc.match(/[–\-]\s*(\d+):(\d+)\s*(AM|PM)/i);
-    if (m) {
-      let h = parseInt(m[1]);
-      const mn = parseInt(m[2]);
-      if (m[3].toUpperCase() === "PM" && h !== 12) h += 12;
-      if (m[3].toUpperCase() === "AM" && h === 12) h = 0;
-      return formatHour(h, mn);
-    }
+    const cleaned = desc.replace(/^[^:]+:\s*/, "").trim();
+    return {
+      isOpen:        openNow,
+      closingTime:   "see hours",
+      hoursDisplay:  cleaned || "Hours vary",
+      todaySessions: [],
+    };
   }
-  return "hours vary";
+
+  return { isOpen: openNow, closingTime: "hours vary", hoursDisplay: "Hours vary", todaySessions: [] };
 }
+
+// ─── Other helpers ────────────────────────────────────────────────────────────
 
 function mapPriceLevel(level?: string): 1 | 2 | 3 {
   switch (level) {
@@ -271,30 +371,31 @@ function inferTags(types: string[] = []): string[] {
 
 function stripCity(address?: string): string {
   if (!address) return "";
-  // Remove trailing Singapore + postal code
   return address
     .replace(/,?\s*Singapore\s*\d{0,6}/gi, "")
     .replace(/,\s*$/, "")
     .trim();
 }
 
-function buildMatchReason(place: PlaceResult, hours?: OpeningHours): string {
+function buildMatchReason(place: PlaceResult, hoursInfo: HoursInfo): string {
   const parts: string[] = [];
   if (place.rating) {
     const count = place.userRatingCount ? ` (${place.userRatingCount.toLocaleString()} reviews)` : "";
     parts.push(`Rated ${place.rating}★${count}`);
   }
-  if (hours?.openNow === true)  parts.push(`open until ${getClosingTime(hours)}`);
-  if (hours?.openNow === false) parts.push("currently closed");
-  if (place.editorialSummary?.text)         parts.push(place.editorialSummary.text);
+  if (hoursInfo.isOpen)  parts.push(`open until ${hoursInfo.closingTime}`);
+  else if (hoursInfo.opensNextAt) parts.push(`opens again at ${hoursInfo.opensNextAt}`);
+  else parts.push("currently closed");
+  if (place.editorialSummary?.text)            parts.push(place.editorialSummary.text);
   else if (place.primaryTypeDisplayName?.text) parts.push(place.primaryTypeDisplayName.text);
   return parts.join(" · ") || "Matches your search";
 }
 
 function mapPlace(place: PlaceResult, index: number, userLat?: number, userLng?: number) {
-  const types   = place.types ?? [];
-  const hours   = place.currentOpeningHours ?? place.regularOpeningHours;
-  const cuisine = place.primaryTypeDisplayName?.text ?? inferCuisine(types);
+  const types     = place.types ?? [];
+  const hours     = place.currentOpeningHours ?? place.regularOpeningHours;
+  const cuisine   = place.primaryTypeDisplayName?.text ?? inferCuisine(types);
+  const hoursInfo = buildHoursInfo(hours);
 
   let distanceM = 0;
   let distance  = "—";
@@ -307,26 +408,31 @@ function mapPlace(place: PlaceResult, index: number, userLat?: number, userLng?:
   }
 
   return {
-    id:          place.id ?? `place-${index}`,
-    name:        place.displayName?.text ?? "Unknown Place",
-    location:    stripCity(place.formattedAddress) || place.formattedAddress || "",
-    fullAddress: place.formattedAddress ?? "",
+    id:            place.id ?? `place-${index}`,
+    name:          place.displayName?.text ?? "Unknown Place",
+    location:      stripCity(place.formattedAddress) || place.formattedAddress || "",
+    fullAddress:   place.formattedAddress ?? "",
     cuisine,
-    priceRange:  mapPriceLevel(place.priceLevel),
-    isOpen:      hours?.openNow ?? true,
-    closingTime: getClosingTime(hours),
-    tags:        inferTags(types),
+    priceRange:    mapPriceLevel(place.priceLevel),
+    isOpen:        hoursInfo.isOpen,
+    closingTime:   hoursInfo.closingTime,
+    hoursDisplay:  hoursInfo.hoursDisplay,
+    opensNextAt:   hoursInfo.opensNextAt,
+    todaySessions: hoursInfo.todaySessions,
+    tags:          inferTags(types),
     distance,
     distanceM,
-    matchReason: buildMatchReason(place, hours),
-    phone:       place.nationalPhoneNumber,
-    rating:      place.rating,
-    placeId:     place.id,
-    sources:     ["google"] as Array<"google" | "reddit" | "nea" | "blog">,
-    websiteUri:  place.websiteUri,
-    reservable:  place.reservable,
-    dineIn:      place.dineIn,
+    matchReason:   buildMatchReason(place, hoursInfo),
+    phone:         place.nationalPhoneNumber,
+    rating:        place.rating,
+    placeId:       place.id,
+    sources:       ["google"] as Array<"google" | "reddit" | "nea" | "blog">,
+    websiteUri:    place.websiteUri,
+    reservable:    place.reservable,
+    dineIn:        place.dineIn,
     userRatingCount: place.userRatingCount,
+    score:         0,
+    photoName:     place.photos?.[0]?.name,
   };
 }
 
@@ -354,7 +460,7 @@ export async function GET(request: NextRequest) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) return NextResponse.json({ error: "API key not configured" }, { status: 500 });
 
-  const startMs = Date.now(); // for analytics timing
+  const startMs = Date.now();
 
   const userLat = latParam ? parseFloat(latParam) : undefined;
   const userLng = lngParam ? parseFloat(lngParam) : undefined;
@@ -363,272 +469,228 @@ export async function GET(request: NextRequest) {
 
   console.log(`[grove] Search: "${query}" | city: ${cityHint ?? "none"} | GPS: ${hasCoords ? `${userLat?.toFixed(4)},${userLng?.toFixed(4)}` : "none"}`);
 
-  // ── 10-minute search cache ────────────────────────────────────────────────
+  // ── Time context ──────────────────────────────────────────────────────────────
+  const now          = new Date();
+  const currentHour  = now.getHours();
+  const timeOfDay    =
+    currentHour < 5  ? "late night" :
+    currentHour < 10 ? "morning"    :
+    currentHour < 14 ? "lunch"      :
+    currentHour < 17 ? "afternoon"  :
+    currentHour < 21 ? "dinner"     : "late night";
+  const timeContext  = `${now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true })} local (${timeOfDay})`;
+
+  // ── Cache check ───────────────────────────────────────────────────────────────
   const coordKey = hasCoords ? `${userLat!.toFixed(3)}_${userLng!.toFixed(3)}` : "nogps";
-  const cacheKey = `search_v3_${query}_${coordKey}`;
-  const cached   = getCached<{ restaurants?: Array<{ name?: string }>; count?: number }>(cacheKey, SEARCH_CACHE_TTL);
+  const cacheKey = `search_v5_${query}_${coordKey}`;
+  const cached   = getCached<object>(cacheKey, SEARCH_CACHE_TTL);
   if (cached) {
     console.log("[grove] Cache hit:", cacheKey);
-    // Log cached hits too — duration reflects cache retrieval speed
     logSearch({
-      query,
-      city:         cityHint,
-      topResult:    cached.restaurants?.[0]?.name,
-      resultsCount: cached.count ?? cached.restaurants?.length ?? 0,
-      durationMs:   Date.now() - startMs,
+      query, city: cityHint,
+      topResult: (cached as { restaurants?: Array<{ name?: string }> }).restaurants?.[0]?.name,
+      resultsCount: (cached as { count?: number }).count ?? 0,
+      durationMs: Date.now() - startMs,
     });
     return NextResponse.json(cached);
   }
 
-  // ── Step 1: Parse query with Claude ─────────────────────────────────────────
-  let parsed: ParsedQuery;
-  try {
-    parsed = await parseQuery(query);
-    console.log("[grove] Parsed:", JSON.stringify(parsed));
-  } catch {
-    parsed = {
-      mapsQuery: query, dietary: [], openNow: false,
-      vibe: [], practical: [], discovery: [],
-      interpretation: `Searching for "${query}"`,
-    };
-  }
+  // ── Streaming response ────────────────────────────────────────────────────────
+  const encoder = new TextEncoder();
 
-  // ── Step 2: Parallel data fetch ──────────────────────────────────────────────
-  const [mapsResult, redditResult, hawkerCentres, blogPosts] =
-    await Promise.allSettled([
-      // 2a: Google Maps — expanding radius with GPS, broad text query
-      fetchMapsPlaces(parsed.mapsQuery, apiKey, userLat, userLng),
-      // 2b: Reddit community signals (pass cityHint as 4th arg for city detection)
-      fetchRedditForQuery(parsed.location ?? cityHint, parsed.mapsQuery, query, cityHint),
-      // 2c: NEA hawker data
-      fetchHawkerCentres(),
-      // 2d: Food blog signals (returns enriched posts with extractedNames)
-      fetchFoodBlogPosts(query, parsed.location ?? cityHint, parsed.mapsQuery),
-    ]);
-
-  // ── Step 3: Process Maps results ──────────────────────────────────────────────
-  let mapsRestaurants: ReturnType<typeof mapPlace>[] = [];
-  if (mapsResult.status === "fulfilled") {
-    mapsRestaurants = mapsResult.value.map((p, i) => mapPlace(p, i, userLat, userLng));
-    console.log(`[grove] Maps: ${mapsRestaurants.length} results`);
-  } else {
-    console.error("[grove] Maps failed:", mapsResult.reason);
-  }
-
-  if (redditResult.status === "fulfilled") {
-    console.log(`[grove] Reddit: ${redditResult.value.posts.length} posts from [${redditResult.value.subreddits.join(", ")}]`);
-  } else {
-    console.error("[grove] Reddit failed:", redditResult.reason);
-  }
-
-  // ── Step 4: Server-side blog fuzzy matching ───────────────────────────────────
-  // Match extracted blog restaurant names against Maps results directly —
-  // more reliable than relying on Claude to make the connection from text context.
-
-  /** Normalise a name for fuzzy comparison */
-  function normName(s: string): string {
-    return s.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
-  }
-
-  function blogFuzzyMatch(blogName: string, mapName: string): boolean {
-    const nb = normName(blogName);
-    const nm = normName(mapName);
-    if (!nb || !nm) return false;
-    if (nb === nm) return true;
-    if (nb.length > 3 && nm.includes(nb)) return true;
-    if (nm.length > 3 && nb.includes(nm)) return true;
-    // All significant words from the shorter name appear in the longer
-    const wordsB = nb.split(" ").filter((w) => w.length > 3);
-    const wordsM = nm.split(" ").filter((w) => w.length > 3);
-    if (wordsB.length > 0 && wordsB.every((w) => nm.includes(w))) return true;
-    if (wordsM.length > 0 && wordsM.every((w) => nb.includes(w))) return true;
-    return false;
-  }
-
-  const rawBlogPosts = blogPosts.status === "fulfilled" ? blogPosts.value : [];
-
-  // Map: mapsRestaurant.id → matching blog source names
-  const blogMatchMap = new Map<string, string[]>();
-  // Blog posts that matched NO Maps result → Blog Pick candidates
-  const unmatchedBlogPosts: typeof rawBlogPosts = [];
-
-  for (const post of rawBlogPosts) {
-    if (post.extractedNames.length === 0) continue;
-
-    let matched = false;
-    for (const extractedName of post.extractedNames) {
-      for (const mapR of mapsRestaurants) {
-        if (blogFuzzyMatch(extractedName, mapR.name)) {
-          const existing = blogMatchMap.get(mapR.id) ?? [];
-          if (!existing.includes(post.source)) existing.push(post.source);
-          blogMatchMap.set(mapR.id, existing);
-          matched = true;
-        }
-      }
-    }
-    if (!matched) unmatchedBlogPosts.push(post);
-  }
-
-  console.log(
-    `[grove] Blog matching: ${rawBlogPosts.length} posts total, ` +
-    `${blogMatchMap.size} Maps results matched, ` +
-    `${unmatchedBlogPosts.length} unmatched (→ Blog Pick candidates)`
-  );
-
-  // ── Step 5: Build community context for Claude ───────────────────────────────
-  const redditCtx = redditResult.status === "fulfilled" ? buildRedditContext(redditResult.value) : "";
-  const blogCtx   = blogPosts.status === "fulfilled"    ? buildBlogContext(rawBlogPosts)          : "";
-
-  // ── Step 6: Rerank via Claude (top 5 for speed) ──────────────────────────────
-  const toRank = mapsRestaurants.slice(0, 5);
-  let ranked:     Awaited<ReturnType<typeof rerankPlaces>>["ranked"]     = [];
-  let redditGems: Awaited<ReturnType<typeof rerankPlaces>>["redditGems"] = [];
-
-  if (toRank.length > 0) {
-    try {
-      const result = await rerankPlaces(query, parsed, toRank, redditCtx, blogCtx);
-      ranked      = result.ranked;
-      redditGems  = result.redditGems;
-      console.log(`[grove] Rerank: ${ranked.length} ranked, ${redditGems.length} Reddit gems`);
-    } catch (err) {
-      console.error("[grove] Rerank failed:", err);
-      ranked = toRank.map((r) => ({ id: r.id, score: 5, matchReason: r.matchReason, sources: ["google"] as const }));
-    }
-  }
-
-  // ── Step 7: Merge ranked + unranked, inject server-side blog matches ──────────
-  const rankedIds = new Set(ranked.map((r) => r.id));
-  const unranked  = mapsRestaurants.filter((r) => !rankedIds.has(r.id));
-
-  const finalMaps = [
-    ...ranked
-      .map((r) => {
-        const rest      = mapsRestaurants.find((p) => p.id === r.id);
-        if (!rest) return null;
-        // Merge server-side blog matches with Claude's sources
-        const serverBlogSources = blogMatchMap.get(r.id) ?? [];
-        const hasBlog    = r.sources.includes("blog") || serverBlogSources.length > 0;
-        const allSources = hasBlog && !r.sources.includes("blog")
-          ? ([...r.sources, "blog"] as typeof r.sources)
-          : r.sources;
-        return {
-          ...rest,
-          matchReason:    r.matchReason,
-          sources:        allSources,
-          redditMentions: allSources.includes("reddit") ? 1 : undefined,
-          blogSources:    hasBlog ? serverBlogSources.slice(0, 2) : undefined,
-        };
-      })
-      .filter(Boolean),
-    // Positions 6-20: pass through, still inject blog matches if found
-    ...unranked.map((r) => {
-      const serverBlogSources = blogMatchMap.get(r.id) ?? [];
-      if (serverBlogSources.length === 0) return r;
-      return {
-        ...r,
-        sources:     [...(r.sources ?? ["google"]), "blog"] as Array<"google"|"reddit"|"nea"|"blog">,
-        blogSources: serverBlogSources.slice(0, 2),
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (obj: object) => {
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+        } catch { /* stream may be closed */ }
       };
-    }),
-  ];
 
-  // ── Step 8: Reddit gem cards ──────────────────────────────────────────────────
-  const redditGemCards = redditGems
-    .filter((gem) => !mapsRestaurants.some((r) => namesMatch(r.name, gem.name)))
-    .map((gem, i) => ({
-      id:          `reddit-gem-${i}`,
-      name:        gem.name,
-      location:    parsed.location ?? cityHint ?? "Nearby",
-      cuisine:     "Local favourite",
-      priceRange:  1 as const,
-      isOpen:      true,
-      closingTime: "varies",
-      tags:        ["Reddit Gem"],
-      distance:    "—",
-      distanceM:   9999,
-      matchReason: gem.reason,
-      sources:     ["reddit"] as Array<"google" | "reddit" | "nea" | "blog">,
-      isRedditGem: true,
-      sourceUrl:   redditResult.status === "fulfilled" ? redditResult.value.posts[0]?.url : undefined,
-    }));
+      try {
+        // ── Step 1: Parse query (~1-2s) ──────────────────────────────────────
+        let parsed: ParsedQuery;
+        try {
+          parsed = await parseQuery(query, timeContext);
+          console.log("[grove] Parsed:", JSON.stringify(parsed));
+        } catch {
+          parsed = {
+            mapsQuery: query, dietary: [], openNow: false,
+            vibe: [], practical: [], discovery: [],
+            interpretation: `Searching for "${query}"`,
+          };
+        }
+        send({ type: "meta", parsed, query });
 
-  // ── Step 8b: Blog Pick cards — blog posts that didn't match Maps ──────────────
-  // De-duplicate by extracted name to avoid showing the same place twice.
-  const blogPickSeen  = new Set<string>();
-  let   blogPickIndex = 0;
-  const blogPickCards = unmatchedBlogPosts
-    .filter((post) => post.extractedNames.length > 0)
-    .flatMap((post) => {
-      const name = post.extractedNames[0]; // one card per post
-      const key  = normName(name);
-      if (blogPickSeen.has(key)) return [];
-      blogPickSeen.add(key);
-      return [{
-        id:          `blog-pick-${blogPickIndex++}`,
-        name,
-        location:    parsed.location ?? cityHint ?? "Nearby",
-        cuisine:     "Blog Pick",
-        priceRange:  2 as const,
-        isOpen:      true,
-        closingTime: "varies",
-        tags:        ["Blog Pick"],
-        distance:    "—",
-        distanceM:   9999,
-        matchReason: `Mentioned in ${post.source}: "${post.title}"`,
-        sources:     ["blog"] as Array<"google" | "reddit" | "nea" | "blog">,
-        isBlogPick:  true,
-        sourceUrl:   post.url,
-        blogSources: [post.source],
-      }];
-    })
-    .slice(0, 3); // max 3 Blog Pick cards
+        // ── Step 2: Fetch Maps + Reddit + Hawker in parallel ─────────────────
+        const [mapsResult, redditResult, hawkerCentres] = await Promise.allSettled([
+          fetchMapsPlaces(parsed.mapsQuery, apiKey, userLat, userLng),
+          fetchRedditForQuery(parsed.location ?? cityHint, parsed.mapsQuery, query, cityHint),
+          fetchHawkerCentres(),
+        ]);
 
-  console.log(`[grove] Blog Pick cards: ${blogPickCards.length}`);
+        // ── Step 3: Process Maps results ─────────────────────────────────────
+        let mapsRestaurants: ReturnType<typeof mapPlace>[] = [];
+        if (mapsResult.status === "fulfilled") {
+          mapsRestaurants = mapsResult.value.map((p, i) => mapPlace(p, i, userLat, userLng));
+          console.log(`[grove] Maps: ${mapsRestaurants.length} results`);
+        } else {
+          console.error("[grove] Maps failed:", mapsResult.reason);
+        }
 
-  // ── Step 9: NEA hawker cards ───────────────────────────────────────────────────
-  const relevantHawkers = hawkerCentres.status === "fulfilled"
-    ? getRelevantHawkerCentres(hawkerCentres.value, query, parsed.location)
-    : [];
-  const hawkerCards = relevantHawkers
-    .filter((hc) => !mapsRestaurants.some((r) => namesMatch(r.name, hc.name)))
-    .map((hc, i) => hawkerToRestaurant(hc, i));
+        const redditPosts = redditResult.status === "fulfilled" ? redditResult.value : null;
+        if (redditPosts) {
+          console.log(`[grove] Reddit: ${redditPosts.posts.length} posts from [${redditPosts.subreddits.join(", ")}]`);
+        }
 
-  // ── Step 10: Assemble ─────────────────────────────────────────────────────────
-  const restaurants = [...finalMaps, ...redditGemCards, ...blogPickCards, ...hawkerCards];
+        // ── Step 4: Send preliminary results (sorted by rating) ──────────────
+        if (mapsRestaurants.length > 0) {
+          const preliminary = [...mapsRestaurants]
+            .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+          send({ type: "results", restaurants: preliminary, partial: true, count: preliminary.length });
+          console.log(`[grove] Sent ${preliminary.length} preliminary results`);
+        }
 
-  console.log(
-    `[grove] Final results: ${restaurants.length} ` +
-    `(${finalMaps.length} maps, ${redditGemCards.length} reddit gems, ` +
-    `${blogPickCards.length} blog picks, ${hawkerCards.length} hawker)`
-  );
+        // ── Step 5: Rerank top 5 with Claude ────────────────────────────────
+        const redditCtx = redditPosts ? buildRedditContext(redditPosts) : "";
+        const toRank    = mapsRestaurants.slice(0, 5).map((r) => ({
+          id:            r.id,
+          name:          r.name,
+          cuisine:       r.cuisine,
+          tags:          r.tags,
+          rating:        r.rating,
+          isOpen:        r.isOpen,
+          matchReason:   r.matchReason,
+          hoursDisplay:  r.hoursDisplay,
+          todaySessions: r.todaySessions,
+          opensNextAt:   r.opensNextAt,
+        }));
 
-  const response = {
-    restaurants,
-    query,
-    parsed,
-    count: restaurants.length,
-    meta: {
-      sources: {
-        google: mapsRestaurants.length,
-        reddit: redditResult.status === "fulfilled" ? redditResult.value.posts.length : 0,
-        nea:    relevantHawkers.length,
-        blogs:  blogPosts.status === "fulfilled" ? blogPosts.value.length : 0,
-      },
-      subreddits: redditResult.status === "fulfilled" ? redditResult.value.subreddits : [],
-      hasCoords,
+        let ranked:     Awaited<ReturnType<typeof rerankPlaces>>["ranked"]     = [];
+        let redditGems: Awaited<ReturnType<typeof rerankPlaces>>["redditGems"] = [];
+
+        if (toRank.length > 0) {
+          try {
+            const result = await rerankPlaces(query, parsed, toRank, redditCtx, "", timeContext);
+            ranked      = result.ranked;
+            redditGems  = result.redditGems;
+            console.log(`[grove] Rerank: ${ranked.length} ranked, ${redditGems.length} Reddit gems`);
+          } catch (err) {
+            console.error("[grove] Rerank failed:", err);
+            ranked = toRank.map((r) => ({
+              id: r.id, score: 5, matchReason: r.matchReason,
+              sources: ["google"] as const,
+            }));
+          }
+        }
+
+        // ── Step 6: Build final sorted list ─────────────────────────────────
+        const rankedIds = new Set(ranked.map((r) => r.id));
+        const unranked  = mapsRestaurants.filter((r) => !rankedIds.has(r.id));
+
+        const finalMaps = [
+          ...ranked
+            .map((r) => {
+              const rest = mapsRestaurants.find((p) => p.id === r.id);
+              if (!rest) return null;
+              const hasReddit = r.sources.includes("reddit");
+              return {
+                ...rest,
+                matchReason:    r.matchReason,
+                matchBullets:   r.matchBullets,
+                sources:        r.sources,
+                score:          r.score,
+                redditMentions: hasReddit ? 1 : undefined,
+              };
+            })
+            .filter((r): r is NonNullable<typeof r> => r !== null)
+            .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || (b.rating ?? 0) - (a.rating ?? 0)),
+          ...unranked
+            .map((r) => ({ ...r, score: 0 }))
+            .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0)),
+        ];
+
+        // ── Step 7: Reddit gem cards ─────────────────────────────────────────
+        const redditGemCards = redditGems
+          .filter((gem) => !mapsRestaurants.some((r) => namesMatch(r.name, gem.name)))
+          .map((gem, i) => ({
+            id:          `reddit-gem-${i}`,
+            name:        gem.name,
+            location:    parsed.location ?? cityHint ?? "Nearby",
+            cuisine:     "Local favourite",
+            priceRange:  1 as const,
+            isOpen:      true,
+            closingTime: "varies",
+            hoursDisplay: "Hours vary",
+            tags:        ["Reddit"],
+            distance:    "—",
+            distanceM:   9999,
+            matchReason: gem.reason,
+            sources:     ["reddit"] as Array<"google" | "reddit" | "nea" | "blog">,
+            isRedditGem: true,
+            score:       0,
+            sourceUrl:   redditPosts?.posts[0]?.url,
+          }));
+
+        // ── Step 8: NEA hawker cards ─────────────────────────────────────────
+        const relevantHawkers = hawkerCentres.status === "fulfilled"
+          ? getRelevantHawkerCentres(hawkerCentres.value, query, parsed.location)
+          : [];
+        const hawkerCards = relevantHawkers
+          .filter((hc) => !mapsRestaurants.some((r) => namesMatch(r.name, hc.name)))
+          .map((hc, i) => hawkerToRestaurant(hc, i));
+
+        // ── Step 9: Send final results ───────────────────────────────────────
+        const restaurants = [...finalMaps, ...redditGemCards, ...hawkerCards];
+
+        console.log(
+          `[grove] Final: ${restaurants.length} total ` +
+          `(${finalMaps.length} maps, ${redditGemCards.length} reddit, ${hawkerCards.length} hawker)`
+        );
+
+        send({ type: "results", restaurants, partial: false, count: restaurants.length });
+
+        // ── Cache + analytics ────────────────────────────────────────────────
+        const responseObj = {
+          restaurants,
+          query,
+          parsed,
+          count: restaurants.length,
+          meta: {
+            sources: {
+              google: mapsRestaurants.length,
+              reddit: redditPosts?.posts.length ?? 0,
+              nea:    relevantHawkers.length,
+            },
+            subreddits: redditPosts?.subreddits ?? [],
+            hasCoords,
+          },
+        };
+        setCached(cacheKey, responseObj);
+        logSearch({
+          query,
+          city:         cityHint,
+          topResult:    restaurants[0]?.name,
+          resultsCount: restaurants.length,
+          durationMs:   Date.now() - startMs,
+        });
+
+        send({ type: "done" });
+
+      } catch (err) {
+        console.error("[grove] Search stream error:", err);
+        send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+      } finally {
+        controller.close();
+      }
     },
-  };
-
-  setCached(cacheKey, response);
-
-  // ── Fire-and-forget analytics — never awaited, never blocks response ─────────
-  logSearch({
-    query,
-    city:         cityHint,
-    topResult:    restaurants[0]?.name,
-    resultsCount: restaurants.length,
-    durationMs:   Date.now() - startMs,
   });
 
-  return NextResponse.json(response);
+  return new Response(stream, {
+    headers: {
+      "Content-Type":           "application/x-ndjson",
+      "Cache-Control":          "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "Transfer-Encoding":      "chunked",
+    },
+  });
 }

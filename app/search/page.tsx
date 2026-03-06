@@ -13,6 +13,14 @@ import type { ParsedQuery } from "@/lib/claude";
 const FILTERS = ["All", "Halal", "Open Now", "Under $15", "Hawker", "Near Me"] as const;
 type FilterOption = typeof FILTERS[number];
 
+function getTimePeriod(hour: number): { label: string; emoji: string } {
+  if (hour < 10) return { label: "Breakfast time",  emoji: "☀️" };
+  if (hour < 14) return { label: "Lunch hour",       emoji: "🍱" };
+  if (hour < 17) return { label: "Afternoon",        emoji: "☕" };
+  if (hour < 21) return { label: "Dinner time",      emoji: "🍽️" };
+  return              { label: "Supper time",        emoji: "🌙" };
+}
+
 type SortOption = "relevance" | "distance" | "price_asc" | "price_desc" | "rating";
 
 const SORT_OPTIONS: { value: SortOption; label: string }[] = [
@@ -75,29 +83,57 @@ const CHIP_STYLES: Record<Chip["color"], React.CSSProperties> = {
 function SkeletonCard() {
   return (
     <div
-      className="rounded-2xl border p-5"
+      className="rounded-2xl border overflow-hidden"
       style={{ background: "#FFFFFF", borderColor: "#E8E4DF", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}
     >
-      <div className="flex justify-between mb-3">
-        <div className="flex-1 space-y-2">
-          <div className="h-5 rounded-lg animate-pulse" style={{ background: "#F0EDE8", width: "65%" }} />
-          <div className="h-3 rounded animate-pulse"   style={{ background: "#F0EDE8", width: "45%" }} />
+      {/* Image placeholder */}
+      <div className="animate-pulse" style={{ height: "160px", background: "#F0EDE8" }} />
+
+      {/* Content */}
+      <div style={{ padding: "16px 20px 20px" }}>
+        <div className="flex justify-between mb-2">
+          <div className="flex-1 space-y-2">
+            <div className="h-5 rounded-lg animate-pulse" style={{ background: "#F0EDE8", width: "65%" }} />
+            <div className="h-3 rounded animate-pulse"   style={{ background: "#F0EDE8", width: "45%" }} />
+          </div>
+          <div className="h-4 w-10 rounded animate-pulse ml-3" style={{ background: "#F0EDE8" }} />
         </div>
-        <div className="h-4 w-10 rounded animate-pulse ml-3" style={{ background: "#F0EDE8" }} />
-      </div>
-      <div className="h-3 rounded animate-pulse mb-4" style={{ background: "#F0EDE8", width: "55%" }} />
-      <div className="rounded-xl p-3 mb-4" style={{ background: "#F5F8F6", border: "1px solid #DCE9E3" }}>
-        <div className="h-2.5 rounded animate-pulse mb-2"  style={{ background: "#DCE9E3", width: "40%" }} />
-        <div className="h-3 rounded animate-pulse mb-1.5"  style={{ background: "#DCE9E3", width: "100%" }} />
-        <div className="h-3 rounded animate-pulse"          style={{ background: "#DCE9E3", width: "80%" }} />
-      </div>
-      {[0, 1].map((row) => (
-        <div key={row} className={`flex gap-1.5 ${row === 1 ? "mt-1.5" : ""}`}>
-          {[0, 1, 2].map((col) => (
-            <div key={col} className="flex-1 h-8 rounded-full animate-pulse" style={{ background: "#F0EDE8" }} />
+        <div className="h-3 rounded animate-pulse mb-3" style={{ background: "#F0EDE8", width: "55%" }} />
+        {/* Chips row */}
+        <div className="flex gap-1.5 mb-3">
+          {[0, 1].map((i) => (
+            <div key={i} className="h-5 w-16 rounded-full animate-pulse" style={{ background: "#F0EDE8" }} />
           ))}
         </div>
-      ))}
+        <div className="rounded-xl p-3 mb-4" style={{ background: "#F5F8F6", border: "1px solid #DCE9E3" }}>
+          <div className="h-2.5 rounded animate-pulse mb-2"  style={{ background: "#DCE9E3", width: "40%" }} />
+          <div className="h-3 rounded animate-pulse mb-1.5"  style={{ background: "#DCE9E3", width: "100%" }} />
+          <div className="h-3 rounded animate-pulse"          style={{ background: "#DCE9E3", width: "80%" }} />
+        </div>
+        {[0, 1].map((row) => (
+          <div key={row} className={`flex gap-1.5 ${row === 1 ? "mt-1.5" : ""}`}>
+            {[0, 1, 2].map((col) => (
+              <div key={col} className="flex-1 h-8 rounded-full animate-pulse" style={{ background: "#F0EDE8" }} />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Ranking indicator ────────────────────────────────────────────────────────
+
+function RankingIndicator() {
+  return (
+    <div className="col-span-full flex items-center justify-center gap-2 py-5">
+      <span
+        className="inline-block w-1.5 h-1.5 rounded-full animate-pulse"
+        style={{ background: "#2D4A3E" }}
+      />
+      <span className="font-sans text-sm" style={{ color: "#6B6561" }}>
+        Ranking results with AI…
+      </span>
     </div>
   );
 }
@@ -117,14 +153,20 @@ function SearchResults() {
   const [activeFilter, setActiveFilter] = useState<FilterOption>("All");
   const [sortBy, setSortBy]             = useState<SortOption>("relevance");
   const [restaurants, setRestaurants]   = useState<Restaurant[]>([]);
-  const [loading, setLoading]           = useState(!!query);
+  // "thinking" = no results yet (show skeletons + thinking text)
+  // "partial"  = preliminary results visible, AI ranking in progress
+  // "done"     = final results shown
+  const [phase, setPhase]               = useState<"thinking" | "partial" | "done">("thinking");
   const [error, setError]               = useState<string | null>(null);
   const [isLive, setIsLive]             = useState(false);
   const [parsed, setParsed]             = useState<ParsedQuery | null>(null);
   const [sortOpen, setSortOpen]         = useState(false);
+  const [currentHour, setCurrentHour]   = useState<number | null>(null);
   const sortRef = useRef<HTMLDivElement>(null);
 
-  // GPS coordinates — initialized from URL params, fallback to localStorage
+  // Capture current hour client-side (avoids SSR mismatch)
+  useEffect(() => { setCurrentHour(new Date().getHours()); }, []);
+
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(() => {
     if (latParam && lngParam) {
       const lat = parseFloat(latParam);
@@ -134,48 +176,42 @@ function SearchResults() {
     return null;
   });
 
-  // Load coords from localStorage, or fall back to direct GPS if localStorage is empty.
-  // maximumAge:60000 returns the last known position instantly when permission was already granted —
-  // no new permission prompt, no delay. This covers the race condition where the user searches
-  // before the home page had time to write GPS to localStorage.
+  // Load GPS from localStorage or browser
   useEffect(() => {
-    if (userCoords) return; // already have from URL params
+    if (userCoords) return;
 
-    // 1. Try localStorage first (instant, synchronous-ish)
     try {
       const cached = localStorage.getItem("grove_location");
       if (cached) {
         const loc = JSON.parse(cached);
         if (typeof loc.lat === "number" && typeof loc.lng === "number") {
           setUserCoords({ lat: loc.lat, lng: loc.lng });
-          return; // done
+          return;
         }
       }
-    } catch { /* ignore corrupt cache */ }
+    } catch { /* ignore */ }
 
-    // 2. localStorage empty or stale — ask the browser for cached position directly.
-    //    maximumAge:60000 means "use cached GPS if it's < 60 s old", which is instant.
-    //    Falls back gracefully (no-op) if GPS was denied or unavailable.
     if (typeof navigator !== "undefined" && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-        () => { /* silently ignore — GPS denied or unavailable */ },
+        () => { /* silently ignore */ },
         { maximumAge: 60_000, timeout: 5_000, enableHighAccuracy: false }
       );
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sync search input with URL
   useEffect(() => { setSearchInput(query); }, [query]);
 
-  // ── Fetch results whenever query or coords change ────────────────────────────
+  // ── Streaming fetch ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!query) return;
 
-    setLoading(true);
+    setPhase("thinking");
     setError(null);
     setIsLive(false);
     setParsed(null);
+    setRestaurants([]);
+    setActiveFilter("All");
 
     const params = new URLSearchParams({ q: query });
     if (cityHint)   params.set("city", cityHint);
@@ -184,27 +220,95 @@ function SearchResults() {
       params.set("lng", userCoords.lng.toString());
     }
 
-    fetch(`/api/search?${params.toString()}`)
-      .then((res) => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch(`/api/search?${params.toString()}`);
         if (!res.ok) throw new Error(`API ${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
-        if (data.parsed) setParsed(data.parsed);
-        if (data.restaurants?.length > 0) {
-          setRestaurants(data.restaurants);
-          setIsLive(true);
+
+        const contentType = res.headers.get("content-type") ?? "";
+
+        if (contentType.includes("application/x-ndjson") && res.body) {
+          // ── Streaming path ────────────────────────────────────────────────
+          const reader  = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer    = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done || cancelled) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+              if (!line.trim() || cancelled) continue;
+              try {
+                const chunk = JSON.parse(line) as {
+                  type: string;
+                  parsed?: ParsedQuery;
+                  restaurants?: Restaurant[];
+                  partial?: boolean;
+                  count?: number;
+                  message?: string;
+                };
+
+                if (chunk.type === "meta" && chunk.parsed) {
+                  // Claude has parsed the query — show interpretation strip
+                  setParsed(chunk.parsed);
+                  // Stay in "thinking" until we have actual results
+
+                } else if (chunk.type === "results" && chunk.restaurants) {
+                  if (chunk.restaurants.length > 0) {
+                    setRestaurants(chunk.restaurants as Restaurant[]);
+                    setIsLive(true);
+                    setPhase(chunk.partial ? "partial" : "done");
+                  } else if (!chunk.partial) {
+                    // Final results came back empty
+                    setRestaurants(mockRestaurants);
+                    setError("No live results found — showing sample data.");
+                    setPhase("done");
+                  }
+
+                } else if (chunk.type === "done") {
+                  setPhase("done");
+
+                } else if (chunk.type === "error") {
+                  throw new Error(chunk.message ?? "Search failed");
+                }
+              } catch { /* skip malformed chunk */ }
+            }
+          }
+
         } else {
-          setRestaurants(mockRestaurants);
-          setError("No live results found — showing sample data.");
+          // ── Cached JSON path (instant) ────────────────────────────────────
+          const data = await res.json() as {
+            parsed?: ParsedQuery;
+            restaurants?: Restaurant[];
+          };
+          if (cancelled) return;
+          if (data.parsed) setParsed(data.parsed);
+          if (data.restaurants && data.restaurants.length > 0) {
+            setRestaurants(data.restaurants);
+            setIsLive(true);
+          } else {
+            setRestaurants(mockRestaurants);
+            setError("No live results found — showing sample data.");
+          }
+          setPhase("done");
         }
-      })
-      .catch(() => {
+      } catch {
+        if (cancelled) return;
         setRestaurants(mockRestaurants);
         setError("Could not load live results — showing sample data.");
-      })
-      .finally(() => setLoading(false));
-  }, [query, cityHint, userCoords]); // re-fetch when coords become available
+        setPhase("done");
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [query, cityHint, userCoords]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Close sort dropdown on outside click
   useEffect(() => {
@@ -217,13 +321,7 @@ function SearchResults() {
     return () => document.removeEventListener("mousedown", onOutside);
   }, []);
 
-  // ── Filter chip handler ──────────────────────────────────────────────────────
-  // Near Me just applies a client-side distance filter — coords are already loaded
-  const handleFilterClick = (filter: FilterOption) => {
-    setActiveFilter(filter);
-  };
-
-  // ── Filter + sort derived list ─────────────────────────────────────────────
+  // ── Filter + sort ──────────────────────────────────────────────────────────
   const displayedRestaurants = useMemo(() => {
     let list = [...restaurants];
 
@@ -248,7 +346,6 @@ function SearchResults() {
         );
         break;
       case "Near Me":
-        // Show results within 1km (distanceM > 0 excludes Reddit gems with placeholder 9999)
         list = list.filter((r) => r.distanceM > 0 && r.distanceM <= 1000);
         break;
     }
@@ -271,7 +368,7 @@ function SearchResults() {
     return list;
   }, [restaurants, activeFilter, sortBy]);
 
-  // ── Navigation ───────────────────────────────────────────────────────────────
+  // ── Navigation ─────────────────────────────────────────────────────────────
   const handleSearch = () => {
     if (!searchInput.trim()) return;
     const params = new URLSearchParams({ q: searchInput.trim() });
@@ -287,12 +384,13 @@ function SearchResults() {
     if (e.key === "Enter") handleSearch();
   };
 
-  const chips = parsed ? buildChips(parsed) : [];
+  const chips           = parsed ? buildChips(parsed) : [];
   const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label ?? "Relevance";
+  const hasResults      = restaurants.length > 0;
 
   return (
     <div className="min-h-screen" style={{ background: "#FAF8F5" }}>
-      {/* ── Sticky header ─────────────────────────────────────────────────── */}
+      {/* ── Sticky header ─────────────────────────────────────────────── */}
       <header
         className="sticky top-0 z-20"
         style={{
@@ -358,7 +456,7 @@ function SearchResults() {
         </div>
       </header>
 
-      {/* ── Main content ───────────────────────────────────────────────────── */}
+      {/* ── Main content ───────────────────────────────────────────────── */}
       <main className="max-w-6xl mx-auto px-4 py-8">
 
         {/* AI interpretation strip */}
@@ -366,7 +464,7 @@ function SearchResults() {
           className="inline-flex items-center gap-2 mb-4 px-4 py-3 rounded-xl"
           style={{ background: "#F5F8F6", border: "1px solid #DCE9E3" }}
         >
-          {loading ? (
+          {phase === "thinking" && !parsed ? (
             <>
               <span className="inline-block w-2 h-2 rounded-full animate-pulse" style={{ background: "#2D4A3E" }} />
               <span className="font-sans" style={{ fontSize: "13px", color: "#3D5248" }}>
@@ -386,7 +484,7 @@ function SearchResults() {
         </div>
 
         {/* Intent chips */}
-        {!loading && chips.length > 0 && (
+        {parsed && chips.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-5">
             {chips.map((chip, i) => (
               <span key={i} className="text-xs font-sans font-medium px-3 py-1 rounded-full" style={CHIP_STYLES[chip.color]}>
@@ -397,7 +495,7 @@ function SearchResults() {
         )}
 
         {/* Error notice */}
-        {error && !loading && (
+        {error && phase === "done" && (
           <div
             className="flex items-center gap-2 mb-5 px-4 py-2.5 rounded-xl"
             style={{ background: "#FFF8EC", border: "1px solid #F5D9A0", display: "inline-flex" }}
@@ -417,14 +515,14 @@ function SearchResults() {
               Results for <span style={{ color: "#2D4A3E" }}>&ldquo;{query}&rdquo;</span>
             </h2>
             <p className="font-sans mt-1" style={{ fontSize: "13px", color: "#9B9590" }}>
-              {loading
+              {!hasResults
                 ? "Searching live data…"
                 : `${displayedRestaurants.length} place${displayedRestaurants.length !== 1 ? "s" : ""}${activeFilter !== "All" ? ` · ${activeFilter}` : ""}${userCoords ? " · Using your location" : ""}`}
             </p>
           </div>
 
-          {/* Sort dropdown — fixed positioning to avoid mobile clipping */}
-          {!loading && restaurants.length > 0 && (
+          {/* Sort dropdown */}
+          {hasResults && (
             <div className="relative" ref={sortRef}>
               <button
                 onClick={() => setSortOpen((o) => !o)}
@@ -444,17 +542,14 @@ function SearchResults() {
                 </svg>
               </button>
 
-              {/* Dropdown — high z-index, positioned to not overflow viewport */}
               {sortOpen && (
                 <div
                   className="absolute right-0 mt-1 rounded-xl overflow-hidden"
                   style={{
-                    zIndex:     9999,
-                    background: "#FFFFFF",
-                    border:     "1px solid #E8E4DF",
-                    boxShadow:  "0 8px 32px rgba(0,0,0,0.14), 0 2px 8px rgba(0,0,0,0.08)",
-                    minWidth:   "210px",
-                    top:        "100%",
+                    zIndex: 9999, background: "#FFFFFF",
+                    border: "1px solid #E8E4DF",
+                    boxShadow: "0 8px 32px rgba(0,0,0,0.14), 0 2px 8px rgba(0,0,0,0.08)",
+                    minWidth: "210px", top: "100%",
                   }}
                 >
                   {SORT_OPTIONS.map((opt) => (
@@ -463,14 +558,11 @@ function SearchResults() {
                       onClick={() => { setSortBy(opt.value); setSortOpen(false); }}
                       className="font-sans w-full text-left"
                       style={{
-                        padding:    "11px 16px",
-                        fontSize:   "13px",
-                        color:      sortBy === opt.value ? "#2D4A3E" : "#3D3D3D",
+                        padding: "11px 16px", fontSize: "13px",
+                        color: sortBy === opt.value ? "#2D4A3E" : "#3D3D3D",
                         fontWeight: sortBy === opt.value ? 600 : 400,
                         background: sortBy === opt.value ? "#F5F8F6" : "transparent",
-                        border:     "none",
-                        cursor:     "pointer",
-                        display:    "block",
+                        border: "none", cursor: "pointer", display: "block",
                       }}
                       onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#F5F8F6")}
                       onMouseLeave={(e) => (
@@ -489,19 +581,17 @@ function SearchResults() {
         </div>
 
         {/* Filter chips */}
-        <div className="flex gap-2 flex-wrap mb-8">
+        <div className="flex gap-2 flex-wrap mb-3">
           {FILTERS.map((filter) => {
             const isActive = activeFilter === filter;
             return (
               <button
                 key={filter}
-                onClick={() => handleFilterClick(filter)}
+                onClick={() => setActiveFilter(filter)}
                 className="font-sans font-medium transition-all duration-150"
                 style={{
-                  fontSize:   "13px",
-                  padding:    "7px 16px",
-                  borderRadius: "9999px",
-                  border:     isActive ? "1px solid #2D4A3E" : "1px solid #E8E4DF",
+                  fontSize: "13px", padding: "7px 16px", borderRadius: "9999px",
+                  border:   isActive ? "1px solid #2D4A3E" : "1px solid #E8E4DF",
                   background: isActive ? "#2D4A3E" : "#FFFFFF",
                   color:      isActive ? "#FFFFFF" : "#6B6561",
                   cursor:     "pointer",
@@ -527,8 +617,31 @@ function SearchResults() {
           })}
         </div>
 
+        {/* Time context chip — subtle suggestion based on current time */}
+        {currentHour !== null && (() => {
+          const { label, emoji } = getTimePeriod(currentHour);
+          return (
+            <div className="flex items-center gap-2 mb-6">
+              <span
+                className="font-sans inline-flex items-center gap-1.5"
+                style={{
+                  fontSize: "12px", color: "#9B9590",
+                  background: "#F5F2EE", border: "1px solid #E8E4DF",
+                  borderRadius: "9999px", padding: "4px 12px",
+                }}
+              >
+                <span>{emoji}</span>
+                <span>{label}</span>
+              </span>
+              <span className="font-sans text-xs" style={{ color: "#C4C0BB" }}>
+                · Results are time-aware
+              </span>
+            </div>
+          );
+        })()}
+
         {/* Empty filter state */}
-        {!loading && displayedRestaurants.length === 0 && restaurants.length > 0 && (
+        {phase !== "thinking" && displayedRestaurants.length === 0 && hasResults && (
           <div className="rounded-2xl border p-8 text-center" style={{ background: "#FFFFFF", borderColor: "#E8E4DF" }}>
             <p className="font-serif text-lg mb-1" style={{ color: "#1A1A1A" }}>No results for this filter</p>
             <p className="font-sans text-sm" style={{ color: "#9B9590" }}>
@@ -545,11 +658,17 @@ function SearchResults() {
 
         {/* Results grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {loading
+          {!hasResults
+            // No results yet — show skeleton loaders
             ? Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)
+            // Results available — show cards
             : displayedRestaurants.map((r) => (
                 <ResultCard key={r.id} restaurant={r} city={cityHint || "Singapore"} />
-              ))}
+              ))
+          }
+
+          {/* Ranking indicator — shown while AI is reranking in background */}
+          {phase === "partial" && hasResults && <RankingIndicator />}
         </div>
 
         <div className="h-16" />

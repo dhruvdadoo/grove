@@ -35,6 +35,7 @@ export interface RankedPlace {
   id: string;
   score: number;        // 0–10; 0 = non-food / excluded
   matchReason: string;
+  matchBullets?: string[];  // 2–3 short evidence bullets
   sources: Array<"google" | "reddit" | "nea" | "blog">;
 }
 
@@ -110,6 +111,11 @@ Singapore context you must understand:
 - Practical signals: "aircon" / "air-conditioned", "parking", "near MRT" / "MRT accessible", "cash only", "reservations", "takeaway only"
 - Discovery signals: "hidden gem" / "underrated", "no queue" / "no waiting", "locals only" / "tourist-free", "new opening", "Instagram-worthy" / "IG-worthy"
 
+TIME CONTEXT: If a [Time context: ...] line is provided in the user message, factor it in:
+- Late night (9pm–4am): lean toward openNow true, afterHour 21
+- Morning (before 10am): lean toward breakfast-appropriate places
+- Use current time to inform openNow and afterHour defaults, but only if the user hasn't specified a time preference
+
 Output ONLY valid JSON matching this TypeScript interface — no markdown, no explanation:
 {
   "mapsQuery": string,
@@ -128,7 +134,7 @@ Output ONLY valid JSON matching this TypeScript interface — no markdown, no ex
   "interpretation": string
 }`;
 
-export async function parseQuery(query: string): Promise<ParsedQuery> {
+export async function parseQuery(query: string, timeContext?: string): Promise<ParsedQuery> {
   const fallback: ParsedQuery = {
     mapsQuery:      query,
     dietary:        [],
@@ -140,8 +146,12 @@ export async function parseQuery(query: string): Promise<ParsedQuery> {
   };
 
   try {
+    const userContent = timeContext
+      ? `${query}\n\n[Time context: ${timeContext}]`
+      : query;
+
     const raw = await callClaude(PARSE_SYSTEM, [
-      { role: "user", content: query },
+      { role: "user", content: userContent },
     ]);
 
     const cleaned = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
@@ -202,6 +212,25 @@ Grove is EXCLUSIVELY a food discovery platform. Every result must be a place whe
 eating or drinking is the primary purpose. When in doubt, set score = 0.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPENING HOURS — SPLIT SESSIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Many restaurants have split hours (Lunch 11:30am–2:30pm, Dinner 5:30pm–10pm).
+isOpen=false does NOT mean a place should be penalized if:
+  • It is currently in an afternoon break (opensNextAt will be set)
+  • The search is for dinner/supper/evening and the dinner session opens later
+Check todaySessions to understand the full day's availability before scoring.
+NEVER penalize a dinner-search result for being closed at 2pm.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIME-AWARE RANKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Current time context is provided in the input. Factor it into ranking:
+  • Late night (9pm+): boost places open now with late hours; penalise places closed for the night
+  • Lunch (11am–2pm): boost lunch spots; don't penalise dinner-only places
+  • Morning (before 10am): prefer breakfast spots
+  • If user explicitly mentions a meal time (supper, lunch, breakfast), that overrides the current time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SCORING GUIDE (for food/drink places that pass the filter above)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 9–10  Perfect match on all key parameters (dietary, cuisine, vibe, time)
@@ -229,11 +258,17 @@ but do NOT appear in the Google Maps candidates list.
 Return up to 3 such "Reddit gems" in the redditGems array.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MATCH REASON FORMAT
+MATCH REASON + BULLETS FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1–2 tight sentences. Specific to WHY this place fits the query.
-Mention: dietary compliance, opening hours relevance, cuisine fit, vibe, community signals.
-Use Singapore food vocabulary naturally. Be enthusiastic but honest.
+matchReason: 1–2 tight sentences specific to WHY this place fits the query.
+  Mention dietary compliance, opening hours relevance, cuisine fit, vibe, community signals.
+  Use Singapore food vocabulary naturally.
+
+matchBullets: Exactly 2–3 short bullets (each under 10 words) covering:
+  • Hours: "Open until midnight" / "Lunch & dinner sessions" / "Opens at 6pm"
+  • Qualification: "Halal certified" / "Vegetarian menu available" / "Michelin Bib Gourmand"
+  • Quality: "4.7★ · 2,800 reviews" / "Local Reddit favourite"
+  • Unique: "Known for wonton noodles" / "No pork, no lard"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — Output ONLY valid JSON, no markdown:
@@ -244,6 +279,7 @@ OUTPUT FORMAT — Output ONLY valid JSON, no markdown:
       "id": "<place_id>",
       "score": <0-10>,
       "matchReason": "<string>",
+      "matchBullets": ["<bullet 1>", "<bullet 2>", "<bullet 3>"],
       "sources": ["google"] | ["google","reddit"] | ["google","blog"] | ["google","reddit","blog"]
     }
   ],
@@ -260,6 +296,9 @@ export interface RerankInput {
   rating?: number;
   isOpen: boolean;
   matchReason: string;
+  hoursDisplay?: string;
+  todaySessions?: Array<{ open: string; close: string }>;
+  opensNextAt?: string;
 }
 
 export async function rerankPlaces(
@@ -267,7 +306,8 @@ export async function rerankPlaces(
   parsed: ParsedQuery,
   places: RerankInput[],
   redditContext: string = "",
-  blogContext: string = ""
+  blogContext: string = "",
+  timeContext: string = ""
 ): Promise<{ ranked: RankedPlace[]; redditGems: RedditGem[] }> {
   const empty = { ranked: [], redditGems: [] };
   if (places.length === 0) return empty;
@@ -277,16 +317,20 @@ export async function rerankPlaces(
     "(no community signals available)";
 
   const userContent = JSON.stringify({
-    originalQuery:   query,
-    parsedIntent:    parsed,
+    originalQuery:    query,
+    parsedIntent:     parsed,
+    currentTime:      timeContext || "(not provided)",
     communitySignals: communitySection,
-    candidates:      places.map((p) => ({
-      id:       p.id,
-      name:     p.name,
-      cuisine:  p.cuisine,
-      tags:     p.tags,
-      rating:   p.rating,
-      isOpen:   p.isOpen,
+    candidates:       places.map((p) => ({
+      id:            p.id,
+      name:          p.name,
+      cuisine:       p.cuisine,
+      tags:          p.tags,
+      rating:        p.rating,
+      isOpen:        p.isOpen,
+      hoursDisplay:  p.hoursDisplay,
+      todaySessions: p.todaySessions,
+      opensNextAt:   p.opensNextAt,
       rawMatchReason: p.matchReason,
     })),
   });

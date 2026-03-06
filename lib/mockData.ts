@@ -40,6 +40,20 @@ export interface Restaurant {
   dineIn?: boolean;
   /** Total number of Google reviews */
   userRatingCount?: number;
+  /** Claude rerank score (0–10) — used for deterministic sort order */
+  score?: number;
+  /** URLs of blog posts that mentioned this place (parallel to blogSources) */
+  blogPostUrls?: string[];
+  /** First Google Places photo resource name (e.g. "places/xxx/photos/yyy") */
+  photoName?: string;
+  /** Formatted hours for today, e.g. "Lunch 11am–3pm · Dinner 6pm–11pm" */
+  hoursDisplay?: string;
+  /** If currently in afternoon break, the time the place reopens, e.g. "6pm" */
+  opensNextAt?: string;
+  /** All sessions today as open/close strings */
+  todaySessions?: Array<{ open: string; close: string }>;
+  /** 2–3 short evidence bullets from Claude reranking */
+  matchBullets?: string[];
 }
 
 export const mockRestaurants: Restaurant[] = [
