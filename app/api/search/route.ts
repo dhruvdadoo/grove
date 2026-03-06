@@ -4,6 +4,7 @@ import { fetchRedditForQuery, buildRedditContext } from "@/lib/reddit";
 import { fetchHawkerCentres, getRelevantHawkerCentres, hawkerToRestaurant } from "@/lib/nea";
 import { fetchFoodBlogPosts, buildBlogContext } from "@/lib/foodblogs";
 import { getCached, setCached } from "@/lib/cache";
+import { logSearch } from "@/lib/analytics";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -350,6 +351,8 @@ export async function GET(request: NextRequest) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) return NextResponse.json({ error: "API key not configured" }, { status: 500 });
 
+  const startMs = Date.now(); // for analytics timing
+
   const userLat = latParam ? parseFloat(latParam) : undefined;
   const userLng = lngParam ? parseFloat(lngParam) : undefined;
   const hasCoords = userLat !== undefined && userLng !== undefined &&
@@ -360,9 +363,17 @@ export async function GET(request: NextRequest) {
   // ── 10-minute search cache ────────────────────────────────────────────────
   const coordKey = hasCoords ? `${userLat!.toFixed(3)}_${userLng!.toFixed(3)}` : "nogps";
   const cacheKey = `search_v3_${query}_${coordKey}`;
-  const cached   = getCached<object>(cacheKey, SEARCH_CACHE_TTL);
+  const cached   = getCached<{ restaurants?: Array<{ name?: string }>; count?: number }>(cacheKey, SEARCH_CACHE_TTL);
   if (cached) {
     console.log("[grove] Cache hit:", cacheKey);
+    // Log cached hits too — duration reflects cache retrieval speed
+    logSearch({
+      query,
+      city:         cityHint,
+      topResult:    cached.restaurants?.[0]?.name,
+      resultsCount: cached.count ?? cached.restaurants?.length ?? 0,
+      durationMs:   Date.now() - startMs,
+    });
     return NextResponse.json(cached);
   }
 
@@ -520,5 +531,15 @@ export async function GET(request: NextRequest) {
   };
 
   setCached(cacheKey, response);
+
+  // ── Fire-and-forget analytics — never awaited, never blocks response ─────────
+  logSearch({
+    query,
+    city:         cityHint,
+    topResult:    restaurants[0]?.name,
+    resultsCount: restaurants.length,
+    durationMs:   Date.now() - startMs,
+  });
+
   return NextResponse.json(response);
 }
