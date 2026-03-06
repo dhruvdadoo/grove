@@ -85,13 +85,24 @@ async function callClaude(
 // ─── parseQuery ───────────────────────────────────────────────────────────────
 
 const PARSE_SYSTEM = `\
-You are Grove's query parser for a Singapore food discovery app.
+You are Grove's query parser for a global food discovery app (default city: Singapore).
 Your job: convert a user's natural-language food search into a strict JSON object.
 
+CRITICAL RULE FOR mapsQuery:
+The mapsQuery field is sent directly to Google Maps Places API as the TEXT SEARCH QUERY.
+GPS coordinates are passed separately as locationBias — do NOT include location/city in mapsQuery.
+WRONG: "Italian restaurant near Toa Payoh Singapore"
+WRONG: "Halal Chinese restaurant Singapore"
+RIGHT: "Italian restaurant"
+RIGHT: "Halal Chinese restaurant"
+RIGHT: "chicken rice hawker stall"
+Keep mapsQuery to: [dietary modifier] [cuisine/dish type] [establishment type]
+Strip out: location names, city names, "near me", "nearby", "in Singapore", coordinates.
+
 Singapore context you must understand:
-- MRT stations, HDB estates, neighbourhoods (Bugis, Toa Payoh, Clementi, Bedok, Jurong, etc.)
+- MRT stations, HDB estates, neighbourhoods (Bugis, Toa Payoh, Clementi, Bedok, Jurong, etc.) → extract as location field, NOT in mapsQuery
 - Singlish food terms: "zi char" (Chinese stir-fry), "hawker" (food-stall hall), "kopitiam" (kopi coffee shop), "cai png" (economy rice), "bak chor mee" (minced meat noodle), "wonton mee", "laksa", "mee pok", "char kway teow", "nasi padang", "roti prata", etc.
-- Singlish phrases: "lah", "lor", "leh", "shiok", "shiok food", "makan" (eat), "jiak" (eat), "supper" (late-night meal), "tapao/dabao" (takeaway), "steady" (good), "sedap" (delicious)
+- Singlish phrases: "lah", "lor", "leh", "shiok", "makan" (eat), "jiak" (eat), "supper" (late-night meal), "tapao/dabao" (takeaway), "sedap" (delicious)
 - Dietary needs: halal, pork-free (no pork), vegetarian, vegan, jain, gluten-free
 - Price signals: "$" / "cheap" / "budget" = budget; "$$" / "mid" / "moderate" = mid; "$$$" / "splurge" / "Michelin" / "fine dining" = splurge; specific amounts like "under $10", "below $20"
 - Time signals: "supper" → afterHour 22, "lunch" → afterHour 11 beforeHour 15, "breakfast" → afterHour 7 beforeHour 11, "open now" → openNow true, "24 hours" / "24h" → afterHour 0

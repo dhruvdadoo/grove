@@ -3,16 +3,20 @@
 import { useState, useEffect, KeyboardEvent } from "react";
 import { useRouter } from "next/navigation";
 
-// ─── City detection helpers ───────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface DetectedLocation {
-  city: string;       // e.g. "Singapore", "Bangkok"
-  country: string;    // e.g. "SG", "TH"
-  label: string;      // display string, e.g. "Singapore"
+  city:    string;   // e.g. "Singapore"
+  country: string;   // e.g. "SG"
+  label:   string;   // display string
+  lat:     number;   // exact GPS latitude
+  lng:     number;   // exact GPS longitude
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 /** Reverse-geocode a lat/lng via BigDataCloud (free, no key required) */
-async function reverseGeocode(lat: number, lng: number): Promise<DetectedLocation | null> {
+async function reverseGeocode(lat: number, lng: number): Promise<{ city: string; country: string; label: string } | null> {
   try {
     const res = await fetch(
       `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`
@@ -20,7 +24,7 @@ async function reverseGeocode(lat: number, lng: number): Promise<DetectedLocatio
     if (!res.ok) return null;
     const d = await res.json();
     return {
-      city:    d.city || d.locality || d.principalSubdivision || "Unknown",
+      city:    d.city || d.locality || d.principalSubdivision || "Nearby",
       country: d.countryCode ?? "",
       label:   d.city || d.locality || d.countryName || "Nearby",
     };
@@ -44,42 +48,62 @@ export default function Home() {
   const [locStatus, setLocStatus] = useState<"idle" | "detecting" | "done" | "denied">("idle");
   const router = useRouter();
 
-  // Auto-detect on mount (silent — no prompt)
+  // Request GPS immediately on mount — store lat/lng with city
   useEffect(() => {
-    // Check localStorage first (avoid re-requesting every page load)
+    // Check localStorage first (avoid re-requesting on every load)
     const cached = localStorage.getItem("grove_location");
     if (cached) {
       try {
-        setLocation(JSON.parse(cached));
-        setLocStatus("done");
-        return;
-      } catch { /* ignore */ }
+        const parsed = JSON.parse(cached) as DetectedLocation;
+        // Only use cache if it has real GPS coords
+        if (parsed.lat && parsed.lng) {
+          setLocation(parsed);
+          setLocStatus("done");
+          return;
+        }
+      } catch { /* ignore corrupt cache */ }
     }
 
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) {
+      setLocStatus("denied");
+      return;
+    }
 
     setLocStatus("detecting");
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
-        const loc = await reverseGeocode(pos.coords.latitude, pos.coords.longitude);
-        if (loc) {
-          setLocation(loc);
-          setLocStatus("done");
-          localStorage.setItem("grove_location", JSON.stringify(loc));
-        } else {
-          setLocStatus("idle");
-        }
+        const { latitude, longitude } = pos.coords;
+        const geo = await reverseGeocode(latitude, longitude);
+        const loc: DetectedLocation = {
+          city:    geo?.city    ?? "Nearby",
+          country: geo?.country ?? "",
+          label:   geo?.label   ?? "Nearby",
+          lat:     latitude,
+          lng:     longitude,
+        };
+        setLocation(loc);
+        setLocStatus("done");
+        localStorage.setItem("grove_location", JSON.stringify(loc));
       },
       () => setLocStatus("denied"),
-      { timeout: 6000, maximumAge: 300_000 }
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 300_000 }
     );
   }, []);
 
+  // Build search URL — always includes lat/lng if available
+  function buildSearchUrl(q: string): string {
+    const params = new URLSearchParams({ q: q.trim() });
+    if (location) {
+      params.set("city", location.city);
+      params.set("lat",  location.lat.toString());
+      params.set("lng",  location.lng.toString());
+    }
+    return `/search?${params.toString()}`;
+  }
+
   const handleSearch = () => {
     if (!query.trim()) return;
-    const params = new URLSearchParams({ q: query.trim() });
-    if (location) params.set("city", location.city);
-    router.push(`/search?${params.toString()}`);
+    router.push(buildSearchUrl(query));
   };
 
   const handleKey = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -87,9 +111,7 @@ export default function Home() {
   };
 
   const handleExample = (q: string) => {
-    const params = new URLSearchParams({ q });
-    if (location) params.set("city", location.city);
-    router.push(`/search?${params.toString()}`);
+    router.push(buildSearchUrl(q));
   };
 
   return (
@@ -149,12 +171,12 @@ export default function Home() {
           }}
           onFocusCapture={(e) => {
             const el = e.currentTarget as HTMLElement;
-            el.style.boxShadow = "0 0 0 3px rgba(45,74,62,0.1), 0 1px 4px rgba(0,0,0,0.05)";
+            el.style.boxShadow  = "0 0 0 3px rgba(45,74,62,0.1), 0 1px 4px rgba(0,0,0,0.05)";
             el.style.borderColor = "#2D4A3E";
           }}
           onBlurCapture={(e) => {
             const el = e.currentTarget as HTMLElement;
-            el.style.boxShadow = "0 1px 4px rgba(0,0,0,0.05)";
+            el.style.boxShadow  = "0 1px 4px rgba(0,0,0,0.05)";
             el.style.borderColor = "#E8E4DF";
           }}
         >
@@ -229,6 +251,11 @@ export default function Home() {
               </button>
             </span>
           )}
+          {locStatus === "denied" && (
+            <span className="font-sans text-xs" style={{ color: "#9B9590" }}>
+              Location access denied — enable it for nearby results
+            </span>
+          )}
         </div>
       </div>
 
@@ -250,9 +277,9 @@ export default function Home() {
             }}
             onMouseEnter={(e) => {
               const el = e.currentTarget as HTMLElement;
-              el.style.background    = "#E8E4DF";
-              el.style.color         = "#2D4A3E";
-              el.style.borderColor   = "#2D4A3E";
+              el.style.background  = "#E8E4DF";
+              el.style.color       = "#2D4A3E";
+              el.style.borderColor = "#2D4A3E";
             }}
             onMouseLeave={(e) => {
               const el = e.currentTarget as HTMLElement;

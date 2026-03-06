@@ -30,6 +30,14 @@ export interface Restaurant {
   sourceUrl?: string;
   /** Full formatted address (before stripping city name) */
   fullAddress?: string;
+  /** Website URI from Google Places (used for smart booking detection) */
+  websiteUri?: string;
+  /** Whether place accepts reservations (from Google Places) */
+  reservable?: boolean;
+  /** Whether place offers dine-in (from Google Places) */
+  dineIn?: boolean;
+  /** Total number of Google reviews */
+  userRatingCount?: number;
 }
 
 export const mockRestaurants: Restaurant[] = [
