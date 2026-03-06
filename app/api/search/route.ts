@@ -139,9 +139,11 @@ async function fetchMapsPlaces(
   userLat?: number,
   userLng?: number
 ): Promise<PlaceResult[]> {
+  // Key passed as query param — header-based auth (X-Goog-Api-Key) is rejected
+  // when the key has HTTP-referrer restrictions, query param works universally.
+  const mapsUrl = `https://places.googleapis.com/v1/places:searchText?key=${apiKey}`;
   const headers = {
     "Content-Type":     "application/json",
-    "X-Goog-Api-Key":   apiKey,
     "X-Goog-FieldMask": FIELD_MASK,
   };
 
@@ -149,7 +151,7 @@ async function fetchMapsPlaces(
     // GPS available: try expanding radius until ≥ MIN_RESULTS
     for (const radius of GPS_RADII) {
       console.log(`[grove] Maps search radius: ${radius}m, query: "${textQuery}"`);
-      const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      const res = await fetch(mapsUrl, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -178,7 +180,7 @@ async function fetchMapsPlaces(
     return [];
   } else {
     // No GPS: use Singapore rectangle bounds
-    const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+    const res = await fetch(mapsUrl, {
       method: "POST",
       headers,
       body: JSON.stringify({
