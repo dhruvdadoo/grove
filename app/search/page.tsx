@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState, useEffect, KeyboardEvent } from "react";
+import { Suspense, useState, useEffect, useMemo, KeyboardEvent } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import ResultCard from "@/components/ResultCard";
@@ -10,9 +10,20 @@ import type { ParsedQuery } from "@/lib/claude";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const FILTERS = ["All", "Halal", "Open Now", "Under $15", "Hawker", "Near Me"];
+const FILTERS = ["All", "Halal", "Open Now", "Under $15", "Hawker", "Near Me"] as const;
+type FilterOption = typeof FILTERS[number];
 
-// ─── Intent chip builder ───────────────────────────────────────────────────────
+type SortOption = "relevance" | "distance" | "price_asc" | "price_desc" | "rating";
+
+const SORT_OPTIONS: { value: SortOption; label: string }[] = [
+  { value: "relevance",  label: "Relevance" },
+  { value: "distance",   label: "Distance (nearest first)" },
+  { value: "price_asc",  label: "Price (low to high)" },
+  { value: "price_desc", label: "Price (high to low)" },
+  { value: "rating",     label: "Rating (highest first)" },
+];
+
+// ─── Intent chip builder ──────────────────────────────────────────────────────
 
 interface Chip {
   label: string;
@@ -22,11 +33,12 @@ interface Chip {
 function buildChips(parsed: ParsedQuery): Chip[] {
   const chips: Chip[] = [];
 
+  // No emojis — clean text only
   if (parsed.location)
-    chips.push({ label: `📍 ${parsed.location}`, color: "blue" });
+    chips.push({ label: parsed.location, color: "blue" });
 
   parsed.dietary.forEach((d) =>
-    chips.push({ label: `✓ ${d}`, color: "green" })
+    chips.push({ label: d, color: "green" })
   );
 
   if (parsed.priceTier === "budget")
@@ -50,13 +62,13 @@ function buildChips(parsed: ParsedQuery): Chip[] {
   }
 
   if (parsed.cuisine)
-    chips.push({ label: `🍜 ${parsed.cuisine}`, color: "amber" });
+    chips.push({ label: parsed.cuisine, color: "amber" });
 
   if (parsed.placeType)
-    chips.push({ label: `🏠 ${parsed.placeType}`, color: "blue" });
+    chips.push({ label: parsed.placeType, color: "blue" });
 
   parsed.vibe.forEach((v) =>
-    chips.push({ label: `✨ ${v}`, color: "purple" })
+    chips.push({ label: v, color: "purple" })
   );
 
   parsed.practical.forEach((p) =>
@@ -64,7 +76,7 @@ function buildChips(parsed: ParsedQuery): Chip[] {
   );
 
   parsed.discovery.forEach((d) =>
-    chips.push({ label: `💎 ${d}`, color: "rose" })
+    chips.push({ label: d, color: "rose" })
   );
 
   return chips;
@@ -155,19 +167,23 @@ function SearchResults() {
   const cityHint = searchParams.get("city") ?? "";
 
   const [searchInput, setSearchInput]   = useState(query);
-  const [activeFilter, setActiveFilter] = useState("All");
+  const [activeFilter, setActiveFilter] = useState<FilterOption>("All");
+  const [sortBy, setSortBy]             = useState<SortOption>("relevance");
   const [restaurants, setRestaurants]   = useState<Restaurant[]>([]);
-  const [loading, setLoading]           = useState(false);
+  // Start loading immediately if we have a query (avoids flash of empty state)
+  const [loading, setLoading]           = useState(!!query);
   const [error, setError]               = useState<string | null>(null);
   const [isLive, setIsLive]             = useState(false);
   const [parsed, setParsed]             = useState<ParsedQuery | null>(null);
+  const [userCoords, setUserCoords]     = useState<{ lat: number; lng: number } | null>(null);
+  const [sortOpen, setSortOpen]         = useState(false);
 
   // Sync input with URL param when navigating
   useEffect(() => {
     setSearchInput(query);
   }, [query]);
 
-  // Fetch live results whenever query changes
+  // Fetch live results whenever query or coords change
   useEffect(() => {
     if (!query) return;
 
@@ -176,23 +192,25 @@ function SearchResults() {
     setIsLive(false);
     setParsed(null);
 
-    const apiUrl = cityHint
-      ? `/api/search?q=${encodeURIComponent(query)}&city=${encodeURIComponent(cityHint)}`
-      : `/api/search?q=${encodeURIComponent(query)}`;
-    fetch(apiUrl)
+    const params = new URLSearchParams({ q: query });
+    if (cityHint) params.set("city", cityHint);
+    if (userCoords) {
+      params.set("lat", userCoords.lat.toString());
+      params.set("lng", userCoords.lng.toString());
+    }
+
+    fetch(`/api/search?${params.toString()}`)
       .then((res) => {
         if (!res.ok) throw new Error(`API responded with ${res.status}`);
         return res.json();
       })
       .then((data) => {
-        // Store Claude's parsed intent
         if (data.parsed) setParsed(data.parsed);
 
         if (data.restaurants?.length > 0) {
           setRestaurants(data.restaurants);
           setIsLive(true);
         } else {
-          // API succeeded but no results — show mock with note
           setRestaurants(mockRestaurants);
           setError("No live results found — showing sample data.");
         }
@@ -203,7 +221,87 @@ function SearchResults() {
         setError("Could not load live results — showing sample data.");
       })
       .finally(() => setLoading(false));
-  }, [query, cityHint]);
+  }, [query, cityHint, userCoords]);
+
+  // ── Filter chip click ──────────────────────────────────────────────────────
+  const handleFilterClick = (filter: FilterOption) => {
+    setActiveFilter(filter);
+
+    // Near Me: request GPS and re-fetch with coordinates
+    if (filter === "Near Me" && !userCoords) {
+      if (typeof navigator !== "undefined" && "geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            setUserCoords({
+              lat: pos.coords.latitude,
+              lng: pos.coords.longitude,
+            });
+            // useEffect will re-trigger due to userCoords change
+          },
+          () => {
+            setError("Location access denied. Enable location to use Near Me.");
+          },
+          { enableHighAccuracy: true, timeout: 8000 }
+        );
+      }
+    }
+  };
+
+  // ── Filter + sort derived list ─────────────────────────────────────────────
+  const displayedRestaurants = useMemo(() => {
+    let list = [...restaurants];
+
+    // Apply filter
+    switch (activeFilter) {
+      case "Halal":
+        list = list.filter(
+          (r) =>
+            r.tags?.includes("Halal") ||
+            r.cuisine?.toLowerCase().includes("halal")
+        );
+        break;
+      case "Open Now":
+        list = list.filter((r) => r.isOpen);
+        break;
+      case "Under $15":
+        list = list.filter((r) => r.priceRange === 1);
+        break;
+      case "Hawker":
+        list = list.filter(
+          (r) =>
+            r.isHawkerCentre ||
+            r.tags?.includes("Hawker Centre") ||
+            r.cuisine?.toLowerCase().includes("hawker")
+        );
+        break;
+      case "Near Me":
+        // Show results within 1km (9999 = Reddit gem placeholder, exclude those)
+        list = list.filter((r) => r.distanceM > 0 && r.distanceM <= 1000);
+        break;
+    }
+
+    // Apply sort
+    switch (sortBy) {
+      case "distance":
+        list.sort(
+          (a, b) =>
+            (a.distanceM ?? Infinity) - (b.distanceM ?? Infinity)
+        );
+        break;
+      case "price_asc":
+        list.sort((a, b) => a.priceRange - b.priceRange);
+        break;
+      case "price_desc":
+        list.sort((a, b) => b.priceRange - a.priceRange);
+        break;
+      case "rating":
+        list.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+        break;
+      // "relevance" — keep original order
+    }
+
+    return list;
+  }, [restaurants, activeFilter, sortBy]);
 
   const handleSearch = () => {
     if (!searchInput.trim()) return;
@@ -217,6 +315,7 @@ function SearchResults() {
   };
 
   const chips = parsed ? buildChips(parsed) : [];
+  const activeSortLabel = SORT_OPTIONS.find((o) => o.value === sortBy)?.label ?? "Relevance";
 
   return (
     <div className="min-h-screen" style={{ background: "#FAF8F5" }}>
@@ -323,7 +422,7 @@ function SearchResults() {
               />
               <span className="font-sans" style={{ fontSize: "13px", color: "#3D5248" }}>
                 <span style={{ fontWeight: 500 }}>Thinking…</span>
-                {" "}understanding your search &amp; querying Google Maps
+                {" "}understanding your search &amp; querying live data
               </span>
             </>
           ) : (
@@ -340,7 +439,7 @@ function SearchResults() {
           )}
         </div>
 
-        {/* Intent chips — shown after results load */}
+        {/* Intent chips — text only, no emojis */}
         {!loading && chips.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-5">
             {chips.map((chip, i) => (
@@ -372,25 +471,97 @@ function SearchResults() {
           </div>
         )}
 
-        {/* Results meta */}
-        <div className="mb-5">
-          <h2
-            className="font-serif"
-            style={{
-              fontSize: "clamp(20px, 3vw, 26px)",
-              color: "#1A1A1A",
-              fontWeight: 400,
-              letterSpacing: "-0.01em",
-            }}
-          >
-            Results for{" "}
-            <span style={{ color: "#2D4A3E" }}>&ldquo;{query}&rdquo;</span>
-          </h2>
-          <p className="font-sans mt-1" style={{ fontSize: "13px", color: "#9B9590" }}>
-            {loading
-              ? "Asking Claude, then fetching live data…"
-              : `${restaurants.length} place${restaurants.length !== 1 ? "s" : ""} found · Sorted by relevance`}
-          </p>
+        {/* Results meta + sort */}
+        <div className="flex items-center justify-between gap-4 mb-5 flex-wrap">
+          <div>
+            <h2
+              className="font-serif"
+              style={{
+                fontSize: "clamp(20px, 3vw, 26px)",
+                color: "#1A1A1A",
+                fontWeight: 400,
+                letterSpacing: "-0.01em",
+              }}
+            >
+              Results for{" "}
+              <span style={{ color: "#2D4A3E" }}>&ldquo;{query}&rdquo;</span>
+            </h2>
+            <p className="font-sans mt-1" style={{ fontSize: "13px", color: "#9B9590" }}>
+              {loading
+                ? "Searching live data…"
+                : `${displayedRestaurants.length} place${displayedRestaurants.length !== 1 ? "s" : ""}${activeFilter !== "All" ? ` · ${activeFilter}` : ""}`}
+            </p>
+          </div>
+
+          {/* Sort dropdown */}
+          {!loading && restaurants.length > 0 && (
+            <div className="relative">
+              <button
+                onClick={() => setSortOpen((o) => !o)}
+                className="font-sans flex items-center gap-2"
+                style={{
+                  fontSize: "13px",
+                  padding: "7px 14px",
+                  borderRadius: "9999px",
+                  border: "1px solid #E8E4DF",
+                  background: "#FFFFFF",
+                  color: "#6B6561",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M3 6h18M7 12h10M11 18h2"/>
+                </svg>
+                {activeSortLabel}
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="m6 9 6 6 6-6"/>
+                </svg>
+              </button>
+              {sortOpen && (
+                <div
+                  className="absolute right-0 mt-1 z-30 rounded-xl overflow-hidden"
+                  style={{
+                    background: "#FFFFFF",
+                    border: "1px solid #E8E4DF",
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.10)",
+                    minWidth: "210px",
+                    top: "100%",
+                  }}
+                >
+                  {SORT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => { setSortBy(opt.value); setSortOpen(false); }}
+                      className="font-sans w-full text-left"
+                      style={{
+                        padding: "10px 16px",
+                        fontSize: "13px",
+                        color: sortBy === opt.value ? "#2D4A3E" : "#3D3D3D",
+                        fontWeight: sortBy === opt.value ? 600 : 400,
+                        background: sortBy === opt.value ? "#F5F8F6" : "transparent",
+                        border: "none",
+                        cursor: "pointer",
+                        display: "block",
+                      }}
+                      onMouseEnter={(e) =>
+                        ((e.currentTarget as HTMLElement).style.background = "#F5F8F6")
+                      }
+                      onMouseLeave={(e) =>
+                        ((e.currentTarget as HTMLElement).style.background =
+                          sortBy === opt.value ? "#F5F8F6" : "transparent")
+                      }
+                    >
+                      {opt.label}
+                      {sortBy === opt.value && (
+                        <span style={{ float: "right", color: "#2D4A3E" }}>✓</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Filter chips */}
@@ -400,7 +571,7 @@ function SearchResults() {
             return (
               <button
                 key={filter}
-                onClick={() => setActiveFilter(filter)}
+                onClick={() => handleFilterClick(filter)}
                 className="font-sans font-medium transition-all duration-150"
                 style={{
                   fontSize: "13px",
@@ -432,11 +603,42 @@ function SearchResults() {
           })}
         </div>
 
+        {/* Close sort dropdown on outside click */}
+        {sortOpen && (
+          <div
+            className="fixed inset-0 z-20"
+            onClick={() => setSortOpen(false)}
+          />
+        )}
+
+        {/* Empty filter state */}
+        {!loading && displayedRestaurants.length === 0 && restaurants.length > 0 && (
+          <div
+            className="rounded-2xl border p-8 text-center"
+            style={{ background: "#FFFFFF", borderColor: "#E8E4DF" }}
+          >
+            <p className="font-serif text-lg mb-1" style={{ color: "#1A1A1A" }}>
+              No results for this filter
+            </p>
+            <p className="font-sans text-sm" style={{ color: "#9B9590" }}>
+              Try a different filter or{" "}
+              <button
+                onClick={() => setActiveFilter("All")}
+                style={{ color: "#2D4A3E", fontWeight: 600, background: "none", border: "none", cursor: "pointer" }}
+              >
+                show all results
+              </button>
+            </p>
+          </div>
+        )}
+
         {/* Results grid — skeletons while loading, real cards after */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {loading
             ? Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)
-            : restaurants.map((r) => <ResultCard key={r.id} restaurant={r} />)}
+            : displayedRestaurants.map((r) => (
+                <ResultCard key={r.id} restaurant={r} city={cityHint || "Singapore"} />
+              ))}
         </div>
 
         <div className="h-16" />

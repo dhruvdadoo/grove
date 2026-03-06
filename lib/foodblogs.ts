@@ -102,6 +102,31 @@ const BLOG_SOURCES: BlogSource[] = [
     searchUrl: (q) =>
       `https://thesmartlocal.com/philippines/?s=${encodeURIComponent(q)}`,
   },
+  // ── New York City ──────────────────────────────────────────────────────────
+  {
+    name:      "eater-ny",
+    city:      "newyork",
+    searchUrl: (q) =>
+      `https://ny.eater.com/search?q=${encodeURIComponent(q)}`,
+  },
+  {
+    name:      "timeout-nyc",
+    city:      "newyork",
+    searchUrl: (q) =>
+      `https://www.timeout.com/newyork/restaurants?q=${encodeURIComponent(q)}`,
+  },
+  {
+    name:      "nymag-restaurants",
+    city:      "newyork",
+    searchUrl: (q) =>
+      `https://www.nymag.com/guides/restaurants/?q=${encodeURIComponent(q)}`,
+  },
+  {
+    name:      "infatuation-nyc",
+    city:      "newyork",
+    searchUrl: (q) =>
+      `https://www.theinfatuation.com/new-york/search?q=${encodeURIComponent(q)}`,
+  },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -195,6 +220,10 @@ function detectBlogCity(location?: string, mapsQuery?: string): string {
   if (h.includes("bangkok")  || h.includes("thailand"))  return "thailand";
   if (h.includes("hong kong") || h.includes(" hk "))     return "hongkong";
   if (h.includes("manila")   || h.includes("philippines")) return "philippines";
+  if (
+    h.includes("new york") || h.includes("nyc") || h.includes("brooklyn") ||
+    h.includes("manhattan") || h.includes("queens") || h.includes("bronx")
+  ) return "newyork";
   return "singapore";
 }
 

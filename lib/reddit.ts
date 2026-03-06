@@ -2,7 +2,7 @@
  * lib/reddit.ts — Community signals from Reddit
  *
  * Uses public Reddit JSON endpoints (no API key required).
- * Each city maps to two subreddits: a food-specific one + the general city sub.
+ * Each city maps to 2-3 subreddits: food-specific + general city sub.
  * Results are cached for 24 hours.
  */
 
@@ -20,7 +20,7 @@ export interface RedditPost {
 
 export interface RedditResult {
   posts: RedditPost[];
-  subreddits: [string, string];
+  subreddits: string[];
   city: string;
 }
 
@@ -29,8 +29,8 @@ export interface RedditResult {
 const TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours
 const REDDIT_UA = "Grove/1.0 Food Discovery App (grove.sg)";
 
-// city keyword → [food subreddit, city subreddit]
-const CITY_MAP: Record<string, [string, string]> = {
+// city keyword → array of subreddits (food-first, then city/general)
+const CITY_MAP: Record<string, string[]> = {
   // Singapore
   singapore:      ["SingaporeEats", "singapore"],
   sg:             ["SingaporeEats", "singapore"],
@@ -82,9 +82,14 @@ const CITY_MAP: Record<string, [string, string]> = {
   // UK
   london:         ["london", "britishfood"],
   uk:             ["london", "unitedkingdom"],
-  // USA
-  "new york":     ["FoodNYC", "AskNYC"],
-  nyc:            ["FoodNYC", "AskNYC"],
+  // USA — New York (3 subreddits)
+  "new york":     ["FoodNYC", "nycfood", "AskNYC"],
+  nyc:            ["FoodNYC", "nycfood", "AskNYC"],
+  brooklyn:       ["FoodNYC", "nycfood", "AskNYC"],
+  manhattan:      ["FoodNYC", "nycfood", "AskNYC"],
+  queens:         ["FoodNYC", "nycfood", "AskNYC"],
+  bronx:          ["FoodNYC", "nycfood", "AskNYC"],
+  // USA — Other cities
   "los angeles":  ["FoodLosAngeles", "LosAngeles"],
   la:             ["FoodLosAngeles", "LosAngeles"],
   "san francisco":["bayarea", "BayAreaFood"],
@@ -112,9 +117,9 @@ export function detectCity(
 
 async function discoverSubredditsForCity(
   city: string
-): Promise<[string, string]> {
+): Promise<string[]> {
   const cacheKey = `reddit_subs_discovery_${city}`;
-  const cached = getCached<[string, string]>(cacheKey, 7 * 24 * 60 * 60 * 1000);
+  const cached = getCached<string[]>(cacheKey, 7 * 24 * 60 * 60 * 1000);
   if (cached) return cached;
 
   try {
@@ -141,7 +146,7 @@ async function discoverSubredditsForCity(
             ?.display_name) as string | undefined) ?? city
         : city;
 
-    const result: [string, string] = [foodSub, citySub];
+    const result: string[] = [foodSub, citySub];
     setCached(cacheKey, result);
     return result;
   } catch {
@@ -198,16 +203,15 @@ export async function fetchRedditForQuery(
   const city = detectCity(location, mapsQuery);
   const subs = CITY_MAP[city] ?? (await discoverSubredditsForCity(city));
 
-  // Pull from both subreddits concurrently
-  const [r0, r1] = await Promise.allSettled([
-    fetchSubredditPosts(subs[0], originalQuery),
-    fetchSubredditPosts(subs[1], `food ${originalQuery}`),
-  ]);
+  // Pull from all subreddits concurrently (supports 2 or 3)
+  const results = await Promise.allSettled(
+    subs.map((sub, i) =>
+      fetchSubredditPosts(sub, i === 0 ? originalQuery : `food ${originalQuery}`)
+    )
+  );
 
-  const all: RedditPost[] = [
-    ...(r0.status === "fulfilled" ? r0.value : []),
-    ...(r1.status === "fulfilled" ? r1.value : []),
-  ]
+  const all: RedditPost[] = results
+    .flatMap((r) => (r.status === "fulfilled" ? r.value : []))
     .sort((a, b) => b.score - a.score)
     .slice(0, 30);
 
@@ -220,13 +224,14 @@ export async function fetchRedditForQuery(
 export function buildRedditContext(result: RedditResult): string {
   if (result.posts.length === 0) return "";
 
+  const subLabel = result.subreddits.map((s) => `r/${s}`).join(" + ");
   const lines = result.posts.slice(0, 15).map((p) => {
     const snippet = p.text.trim() ? ` — "${p.text.slice(0, 200)}"` : "";
     return `• [r/${p.subreddit} ↑${p.score}] "${p.title}"${snippet}`;
   });
 
   return [
-    `=== REDDIT COMMUNITY SIGNALS (r/${result.subreddits[0]} + r/${result.subreddits[1]}) ===`,
+    `=== REDDIT COMMUNITY SIGNALS (${subLabel}) ===`,
     ...lines,
   ].join("\n");
 }

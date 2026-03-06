@@ -129,19 +129,20 @@ interface ActionBtnProps {
   label:    string;
   href?:    string;
   onClick?: () => void;
+  disabled?: boolean;
 }
 
-const ActionBtn = ({ label, href, onClick }: ActionBtnProps) => {
+const ActionBtn = ({ label, href, onClick, disabled }: ActionBtnProps) => {
   const baseStyle: React.CSSProperties = {
-    background:     "#EBF1ED",
-    color:          "#2D4A3E",
+    background:     disabled ? "#F5F5F5" : "#EBF1ED",
+    color:          disabled ? "#BABABA" : "#2D4A3E",
     borderRadius:   "9999px",
     padding:        "8px 0",
     fontSize:       "12px",
     fontWeight:     500,
     letterSpacing:  "0.02em",
     textAlign:      "center",
-    cursor:         "pointer",
+    cursor:         disabled ? "default" : "pointer",
     border:         "none",
     textDecoration: "none",
     display:        "flex",
@@ -151,12 +152,14 @@ const ActionBtn = ({ label, href, onClick }: ActionBtnProps) => {
     transition:     "background 0.15s",
   };
 
-  const enter = (e: React.MouseEvent<HTMLElement>) =>
-    ((e.currentTarget as HTMLElement).style.background = "#D5E6DB");
-  const leave = (e: React.MouseEvent<HTMLElement>) =>
-    ((e.currentTarget as HTMLElement).style.background = "#EBF1ED");
+  const enter = (e: React.MouseEvent<HTMLElement>) => {
+    if (!disabled) (e.currentTarget as HTMLElement).style.background = "#D5E6DB";
+  };
+  const leave = (e: React.MouseEvent<HTMLElement>) => {
+    if (!disabled) (e.currentTarget as HTMLElement).style.background = "#EBF1ED";
+  };
 
-  if (href) {
+  if (href && !disabled) {
     return (
       <a
         href={href}
@@ -173,11 +176,12 @@ const ActionBtn = ({ label, href, onClick }: ActionBtnProps) => {
   }
   return (
     <button
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
       className="font-sans"
       style={baseStyle}
       onMouseEnter={enter}
       onMouseLeave={leave}
+      disabled={disabled}
     >
       {label}
     </button>
@@ -186,7 +190,12 @@ const ActionBtn = ({ label, href, onClick }: ActionBtnProps) => {
 
 // ─── Main card ────────────────────────────────────────────────────────────────
 
-export default function ResultCard({ restaurant }: { restaurant: Restaurant }) {
+interface ResultCardProps {
+  restaurant: Restaurant;
+  city?: string; // detected city from geolocation (e.g. "Singapore", "New York")
+}
+
+export default function ResultCard({ restaurant, city = "Singapore" }: ResultCardProps) {
   const {
     name, location, cuisine, priceRange,
     isOpen, closingTime, tags, distance,
@@ -195,40 +204,58 @@ export default function ResultCard({ restaurant }: { restaurant: Restaurant }) {
     isRedditGem, isHawkerCentre, sourceUrl,
   } = restaurant;
 
-  const slug     = encodeURIComponent(`${name} ${location}`);
-  const nameSlug = encodeURIComponent(name);
+  // ── URL building ─────────────────────────────────────────────────────────────
 
-  const mapsUrl    = placeId
+  // Maps search URL — uses actual address, no hardcoded city
+  const mapsSearchQ   = encodeURIComponent(`${name} ${location}`);
+  const mapsSearchUrl = `https://www.google.com/maps/search/?q=${mapsSearchQ}`;
+
+  // Maps button deep-links to place_id if available, otherwise search
+  const mapsUrl = placeId
     ? `https://www.google.com/maps/place/?q=place_id:${placeId}`
-    : `https://www.google.com/maps/search/?api=1&query=${slug}`;
-  const reviewsUrl = placeId
-    ? `https://search.google.com/local/reviews?placeid=${placeId}`
-    : `https://www.google.com/maps/search/?api=1&query=${slug}`;
+    : mapsSearchUrl;
 
+  // Reviews — always use search URL so it opens the right reviews panel
+  const reviewsUrl = `https://www.google.com/maps/search/?q=${encodeURIComponent(`${name} ${location} reviews`)}`;
+
+  // Booking — Chope for Singapore, Google search for everywhere else
+  const isSingapore = !city || /singapore|sg\b/i.test(city);
+  const bookingUrl  = isSingapore
+    ? `https://www.chope.co/singapore-restaurants/search?q=${encodeURIComponent(name)}`
+    : `https://www.google.com/search?q=${encodeURIComponent(`${name} ${city} reservation booking`)}`;
+
+  // TikTok — uses detected city, not hardcoded Singapore
+  const tiktokUrl = `https://www.tiktok.com/search?q=${encodeURIComponent(`${name} ${city}`)}`;
+
+  // Share — just the Google Maps URL so recipient can open it directly
   const handleShare = async () => {
+    const shareText = `Check out ${name} — ${mapsSearchUrl}`;
     try {
-      await navigator.share({
-        title: name,
-        text:  `Check out ${name} on Grove`,
-        url:   `https://grove.sg/search?q=${nameSlug}`,
-      });
+      if (typeof navigator !== "undefined" && navigator.share) {
+        await navigator.share({ title: name, text: shareText, url: mapsSearchUrl });
+      } else if (typeof navigator !== "undefined" && navigator.clipboard) {
+        await navigator.clipboard.writeText(shareText);
+      }
     } catch { /* cancelled / unsupported */ }
   };
 
+  // ── Action rows ──────────────────────────────────────────────────────────────
+
   const topRow: ActionBtnProps[] = [
-    { label: "Maps",   href: mapsUrl },
-    { label: "Grab",   href: `https://food.grab.com/sg/en/search?searchKeyword=${nameSlug}` },
-    { label: "TikTok", href: `https://www.tiktok.com/search?q=${nameSlug}` },
+    { label: "Maps",    href: mapsUrl },
+    { label: "Booking", href: bookingUrl },
+    { label: "TikTok",  href: tiktokUrl },
   ];
   const bottomRow: ActionBtnProps[] = [
     phone
       ? { label: "Call",    href: `tel:${phone}` }
-      : { label: "Call",    onClick: () => {} },
+      : { label: "Call",    disabled: true },
     { label: "Share",   onClick: handleShare },
     { label: "Reviews", href: reviewsUrl },
   ];
 
-  // Decide card accent: Reddit gems get a subtle rose tint, NEA gets amber, normal stays white
+  // ── Card accent ──────────────────────────────────────────────────────────────
+
   const cardBg = isRedditGem
     ? "#FFFBFB"
     : isHawkerCentre
@@ -411,14 +438,11 @@ export default function ResultCard({ restaurant }: { restaurant: Restaurant }) {
         </div>
       )}
 
-      {/* Reddit gems get a single "Find on Maps" CTA instead */}
+      {/* Reddit gems get simplified CTAs */}
       {isRedditGem && (
         <div className="flex gap-1.5">
-          <ActionBtn label="Find on Maps" href={mapsUrl} />
-          <ActionBtn
-            label="TikTok"
-            href={`https://www.tiktok.com/search?q=${nameSlug}`}
-          />
+          <ActionBtn label="Find on Maps" href={mapsSearchUrl} />
+          <ActionBtn label="TikTok" href={tiktokUrl} />
           {sourceUrl && (
             <ActionBtn label="Reddit thread" href={sourceUrl} />
           )}

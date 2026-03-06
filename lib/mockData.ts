@@ -28,6 +28,8 @@ export interface Restaurant {
   isRedditGem?: boolean;
   /** URL to the source (Reddit thread, blog post) */
   sourceUrl?: string;
+  /** Full formatted address (before stripping city name) */
+  fullAddress?: string;
 }
 
 export const mockRestaurants: Restaurant[] = [

@@ -1,0 +1,9 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "env": {
+    "GOOGLE_MAPS_API_KEY": "@google-maps-api-key",
+    "ANTHROPIC_API_KEY": "@anthropic-api-key"
+  }
+}
