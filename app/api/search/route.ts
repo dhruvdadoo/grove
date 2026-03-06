@@ -398,11 +398,11 @@ export async function GET(request: NextRequest) {
     await Promise.allSettled([
       // 2a: Google Maps — expanding radius with GPS, broad text query
       fetchMapsPlaces(parsed.mapsQuery, apiKey, userLat, userLng),
-      // 2b: Reddit community signals
-      fetchRedditForQuery(parsed.location ?? cityHint, parsed.mapsQuery, query),
+      // 2b: Reddit community signals (pass cityHint as 4th arg for city detection)
+      fetchRedditForQuery(parsed.location ?? cityHint, parsed.mapsQuery, query, cityHint),
       // 2c: NEA hawker data
       fetchHawkerCentres(),
-      // 2d: Food blog signals
+      // 2d: Food blog signals (returns enriched posts with extractedNames)
       fetchFoodBlogPosts(query, parsed.location ?? cityHint, parsed.mapsQuery),
     ]);
 
@@ -415,28 +415,69 @@ export async function GET(request: NextRequest) {
     console.error("[grove] Maps failed:", mapsResult.reason);
   }
 
-  // ── Step 4: Blog debug logging ───────────────────────────────────────────────
-  if (blogPosts.status === "fulfilled") {
-    const posts = blogPosts.value;
-    console.log(`[grove] Blog posts: ${posts.length} results`);
-    if (posts.length > 0) {
-      console.log("[grove] Blog samples:", posts.slice(0, 5).map((p) => `[${p.source}] ${p.title}`).join(" | "));
-    } else {
-      console.log("[grove] Blog: no posts returned — check blog scraper and cache");
-    }
-  } else {
-    console.error("[grove] Blog fetch failed:", blogPosts.reason);
-  }
-
   if (redditResult.status === "fulfilled") {
-    console.log(`[grove] Reddit: ${redditResult.value.posts.length} posts from ${redditResult.value.subreddits.join(", ")}`);
+    console.log(`[grove] Reddit: ${redditResult.value.posts.length} posts from [${redditResult.value.subreddits.join(", ")}]`);
   } else {
     console.error("[grove] Reddit failed:", redditResult.reason);
   }
 
+  // ── Step 4: Server-side blog fuzzy matching ───────────────────────────────────
+  // Match extracted blog restaurant names against Maps results directly —
+  // more reliable than relying on Claude to make the connection from text context.
+
+  /** Normalise a name for fuzzy comparison */
+  function normName(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  function blogFuzzyMatch(blogName: string, mapName: string): boolean {
+    const nb = normName(blogName);
+    const nm = normName(mapName);
+    if (!nb || !nm) return false;
+    if (nb === nm) return true;
+    if (nb.length > 3 && nm.includes(nb)) return true;
+    if (nm.length > 3 && nb.includes(nm)) return true;
+    // All significant words from the shorter name appear in the longer
+    const wordsB = nb.split(" ").filter((w) => w.length > 3);
+    const wordsM = nm.split(" ").filter((w) => w.length > 3);
+    if (wordsB.length > 0 && wordsB.every((w) => nm.includes(w))) return true;
+    if (wordsM.length > 0 && wordsM.every((w) => nb.includes(w))) return true;
+    return false;
+  }
+
+  const rawBlogPosts = blogPosts.status === "fulfilled" ? blogPosts.value : [];
+
+  // Map: mapsRestaurant.id → matching blog source names
+  const blogMatchMap = new Map<string, string[]>();
+  // Blog posts that matched NO Maps result → Blog Pick candidates
+  const unmatchedBlogPosts: typeof rawBlogPosts = [];
+
+  for (const post of rawBlogPosts) {
+    if (post.extractedNames.length === 0) continue;
+
+    let matched = false;
+    for (const extractedName of post.extractedNames) {
+      for (const mapR of mapsRestaurants) {
+        if (blogFuzzyMatch(extractedName, mapR.name)) {
+          const existing = blogMatchMap.get(mapR.id) ?? [];
+          if (!existing.includes(post.source)) existing.push(post.source);
+          blogMatchMap.set(mapR.id, existing);
+          matched = true;
+        }
+      }
+    }
+    if (!matched) unmatchedBlogPosts.push(post);
+  }
+
+  console.log(
+    `[grove] Blog matching: ${rawBlogPosts.length} posts total, ` +
+    `${blogMatchMap.size} Maps results matched, ` +
+    `${unmatchedBlogPosts.length} unmatched (→ Blog Pick candidates)`
+  );
+
   // ── Step 5: Build community context for Claude ───────────────────────────────
   const redditCtx = redditResult.status === "fulfilled" ? buildRedditContext(redditResult.value) : "";
-  const blogCtx   = blogPosts.status === "fulfilled"    ? buildBlogContext(blogPosts.value)      : "";
+  const blogCtx   = blogPosts.status === "fulfilled"    ? buildBlogContext(rawBlogPosts)          : "";
 
   // ── Step 6: Rerank via Claude (top 5 for speed) ──────────────────────────────
   const toRank = mapsRestaurants.slice(0, 5);
@@ -449,38 +490,46 @@ export async function GET(request: NextRequest) {
       ranked      = result.ranked;
       redditGems  = result.redditGems;
       console.log(`[grove] Rerank: ${ranked.length} ranked, ${redditGems.length} Reddit gems`);
-      // Log blog signal hits
-      const blogHits = ranked.filter((r) => r.sources.includes("blog"));
-      console.log(`[grove] Blog hits in rerank: ${blogHits.length} (${blogHits.map((r) => r.id).join(", ")})`);
     } catch (err) {
       console.error("[grove] Rerank failed:", err);
       ranked = toRank.map((r) => ({ id: r.id, score: 5, matchReason: r.matchReason, sources: ["google"] as const }));
     }
   }
 
-  // ── Step 7: Merge ranked + unranked ──────────────────────────────────────────
-  const rankedIds  = new Set(ranked.map((r) => r.id));
-  const unranked   = mapsRestaurants.filter((r) => !rankedIds.has(r.id));
-
-  const blogSourceNames = blogPosts.status === "fulfilled"
-    ? [...new Set(blogPosts.value.map((b) => b.source))].slice(0, 2)
-    : [];
+  // ── Step 7: Merge ranked + unranked, inject server-side blog matches ──────────
+  const rankedIds = new Set(ranked.map((r) => r.id));
+  const unranked  = mapsRestaurants.filter((r) => !rankedIds.has(r.id));
 
   const finalMaps = [
     ...ranked
       .map((r) => {
-        const rest = mapsRestaurants.find((p) => p.id === r.id);
+        const rest      = mapsRestaurants.find((p) => p.id === r.id);
         if (!rest) return null;
+        // Merge server-side blog matches with Claude's sources
+        const serverBlogSources = blogMatchMap.get(r.id) ?? [];
+        const hasBlog    = r.sources.includes("blog") || serverBlogSources.length > 0;
+        const allSources = hasBlog && !r.sources.includes("blog")
+          ? ([...r.sources, "blog"] as typeof r.sources)
+          : r.sources;
         return {
           ...rest,
-          matchReason:   r.matchReason,
-          sources:       r.sources,
-          redditMentions: r.sources.includes("reddit") ? 1 : undefined,
-          blogSources:    r.sources.includes("blog") ? blogSourceNames : undefined,
+          matchReason:    r.matchReason,
+          sources:        allSources,
+          redditMentions: allSources.includes("reddit") ? 1 : undefined,
+          blogSources:    hasBlog ? serverBlogSources.slice(0, 2) : undefined,
         };
       })
       .filter(Boolean),
-    ...unranked, // positions 5-19 pass through unmodified
+    // Positions 6-20: pass through, still inject blog matches if found
+    ...unranked.map((r) => {
+      const serverBlogSources = blogMatchMap.get(r.id) ?? [];
+      if (serverBlogSources.length === 0) return r;
+      return {
+        ...r,
+        sources:     [...(r.sources ?? ["google"]), "blog"] as Array<"google"|"reddit"|"nea"|"blog">,
+        blogSources: serverBlogSources.slice(0, 2),
+      };
+    }),
   ];
 
   // ── Step 8: Reddit gem cards ──────────────────────────────────────────────────
@@ -503,6 +552,39 @@ export async function GET(request: NextRequest) {
       sourceUrl:   redditResult.status === "fulfilled" ? redditResult.value.posts[0]?.url : undefined,
     }));
 
+  // ── Step 8b: Blog Pick cards — blog posts that didn't match Maps ──────────────
+  // De-duplicate by extracted name to avoid showing the same place twice.
+  const blogPickSeen  = new Set<string>();
+  let   blogPickIndex = 0;
+  const blogPickCards = unmatchedBlogPosts
+    .filter((post) => post.extractedNames.length > 0)
+    .flatMap((post) => {
+      const name = post.extractedNames[0]; // one card per post
+      const key  = normName(name);
+      if (blogPickSeen.has(key)) return [];
+      blogPickSeen.add(key);
+      return [{
+        id:          `blog-pick-${blogPickIndex++}`,
+        name,
+        location:    parsed.location ?? cityHint ?? "Nearby",
+        cuisine:     "Blog Pick",
+        priceRange:  2 as const,
+        isOpen:      true,
+        closingTime: "varies",
+        tags:        ["Blog Pick"],
+        distance:    "—",
+        distanceM:   9999,
+        matchReason: `Mentioned in ${post.source}: "${post.title}"`,
+        sources:     ["blog"] as Array<"google" | "reddit" | "nea" | "blog">,
+        isBlogPick:  true,
+        sourceUrl:   post.url,
+        blogSources: [post.source],
+      }];
+    })
+    .slice(0, 3); // max 3 Blog Pick cards
+
+  console.log(`[grove] Blog Pick cards: ${blogPickCards.length}`);
+
   // ── Step 9: NEA hawker cards ───────────────────────────────────────────────────
   const relevantHawkers = hawkerCentres.status === "fulfilled"
     ? getRelevantHawkerCentres(hawkerCentres.value, query, parsed.location)
@@ -512,9 +594,13 @@ export async function GET(request: NextRequest) {
     .map((hc, i) => hawkerToRestaurant(hc, i));
 
   // ── Step 10: Assemble ─────────────────────────────────────────────────────────
-  const restaurants = [...finalMaps, ...redditGemCards, ...hawkerCards];
+  const restaurants = [...finalMaps, ...redditGemCards, ...blogPickCards, ...hawkerCards];
 
-  console.log(`[grove] Final results: ${restaurants.length} (${finalMaps.length} maps, ${redditGemCards.length} reddit gems, ${hawkerCards.length} hawker)`);
+  console.log(
+    `[grove] Final results: ${restaurants.length} ` +
+    `(${finalMaps.length} maps, ${redditGemCards.length} reddit gems, ` +
+    `${blogPickCards.length} blog picks, ${hawkerCards.length} hawker)`
+  );
 
   const response = {
     restaurants,

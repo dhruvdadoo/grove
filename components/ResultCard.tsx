@@ -31,6 +31,7 @@ const TAG_STYLES: Record<string, React.CSSProperties> = {
   "No Pork":       { background: "#FFF8EC", color: "#8B5C1A",  border: "1px solid #F5D9A0" },
   "Hawker Centre": { background: "#FFF3E0", color: "#E65100",  border: "1px solid #FFB74D" },
   "Reddit Gem":    { background: "#FFF1F2", color: "#BE123C",  border: "1px solid #FECDD3" },
+  "Blog Pick":     { background: "#F5F3FF", color: "#6D28D9",  border: "1px solid #DDD6FE" },
 };
 
 const TagBadge = ({ tag }: { tag: string }) => (
@@ -167,7 +168,7 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
     isOpen, closingTime, tags, distance,
     matchReason, phone, rating, placeId,
     sources = ["google"], blogSources, redditMentions,
-    isRedditGem, isHawkerCentre, sourceUrl,
+    isRedditGem, isBlogPick, isHawkerCentre, sourceUrl,
     websiteUri, reservable, dineIn, userRatingCount,
   } = restaurant;
 
@@ -234,7 +235,7 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
 
   // ── Card accent ──────────────────────────────────────────────────────────────
 
-  const cardBg      = isRedditGem ? "#FFFBFB" : isHawkerCentre ? "#FFFDF5" : "#FFFFFF";
+  const cardBg      = isRedditGem ? "#FFFBFB" : isBlogPick ? "#FDFBFF" : isHawkerCentre ? "#FFFDF5" : "#FFFFFF";
   const hasReddit   = sources.includes("reddit");
   const hasBlog     = sources.includes("blog");
   const hasGoogle   = sources.includes("google");
@@ -245,7 +246,7 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
       className="flex flex-col rounded-2xl border transition-all duration-200"
       style={{
         background:  cardBg,
-        borderColor: isRedditGem ? "#FECDD3" : isHawkerCentre ? "#FFB74D" : "#E8E4DF",
+        borderColor: isRedditGem ? "#FECDD3" : isBlogPick ? "#DDD6FE" : isHawkerCentre ? "#FFB74D" : "#E8E4DF",
         padding:     "20px",
         boxShadow:   "0 1px 3px rgba(0,0,0,0.04)",
       }}
@@ -324,6 +325,13 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
               View thread ↗
             </a>
           )}
+          {isBlogPick && sourceUrl && (
+            <a href={sourceUrl} target="_blank" rel="noopener noreferrer"
+              className="text-[10px] font-sans font-semibold underline"
+              style={{ color: "#6D28D9", alignSelf: "center" }}>
+              Read post ↗
+            </a>
+          )}
         </div>
       )}
 
@@ -336,12 +344,12 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
         }}
       >
         <div className="flex items-center gap-1.5 mb-1.5">
-          <span className="text-xs" style={{ color: isRedditGem ? "#BE123C" : "#2D4A3E" }}>
-            {isRedditGem ? "🔴" : isHawkerCentre ? "🏛️" : "✦"}
+          <span className="text-xs" style={{ color: isRedditGem ? "#BE123C" : isBlogPick ? "#6D28D9" : "#2D4A3E" }}>
+            {isRedditGem ? "🔴" : isBlogPick ? "📖" : isHawkerCentre ? "🏛️" : "✦"}
           </span>
           <span className="text-[10px] font-sans font-semibold tracking-widest uppercase"
-            style={{ color: isRedditGem ? "#BE123C" : "#2D4A3E" }}>
-            {isRedditGem ? "Why locals love it" : isHawkerCentre ? "About this hawker centre" : "Matches because"}
+            style={{ color: isRedditGem ? "#BE123C" : isBlogPick ? "#6D28D9" : "#2D4A3E" }}>
+            {isRedditGem ? "Why locals love it" : isBlogPick ? "Featured in food blogs" : isHawkerCentre ? "About this hawker centre" : "Matches because"}
           </span>
         </div>
         <p className="text-xs font-sans leading-relaxed" style={{ color: "#3D5248" }}>
@@ -350,7 +358,7 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
       </div>
 
       {/* Action buttons — 2 rows of 3 */}
-      {!isRedditGem && (
+      {!isRedditGem && !isBlogPick && (
         <div className="flex flex-col gap-1.5">
           <div className="flex gap-1.5">
             {topRow.map((btn) => <ActionBtn key={btn.label} {...btn} />)}
@@ -367,6 +375,15 @@ export default function ResultCard({ restaurant, city = "Singapore" }: ResultCar
           <ActionBtn label="Find on Maps" href={mapsUrl} />
           <ActionBtn label="TikTok" onClick={() => openTikTok(name, city)} />
           {sourceUrl && <ActionBtn label="Reddit thread" href={sourceUrl} />}
+        </div>
+      )}
+
+      {/* Blog Pick CTAs */}
+      {isBlogPick && (
+        <div className="flex gap-1.5">
+          <ActionBtn label="Find on Maps" href={mapsUrl} />
+          <ActionBtn label="TikTok" onClick={() => openTikTok(name, city)} />
+          {sourceUrl && <ActionBtn label="Read post ↗" href={sourceUrl} />}
         </div>
       )}
     </article>

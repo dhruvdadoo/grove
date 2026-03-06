@@ -134,18 +134,35 @@ function SearchResults() {
     return null;
   });
 
-  // Load coords from localStorage if not in URL (e.g. navigating directly to /search)
+  // Load coords from localStorage, or fall back to direct GPS if localStorage is empty.
+  // maximumAge:60000 returns the last known position instantly when permission was already granted —
+  // no new permission prompt, no delay. This covers the race condition where the user searches
+  // before the home page had time to write GPS to localStorage.
   useEffect(() => {
     if (userCoords) return; // already have from URL params
+
+    // 1. Try localStorage first (instant, synchronous-ish)
     try {
       const cached = localStorage.getItem("grove_location");
       if (cached) {
         const loc = JSON.parse(cached);
         if (typeof loc.lat === "number" && typeof loc.lng === "number") {
           setUserCoords({ lat: loc.lat, lng: loc.lng });
+          return; // done
         }
       }
-    } catch { /* ignore */ }
+    } catch { /* ignore corrupt cache */ }
+
+    // 2. localStorage empty or stale — ask the browser for cached position directly.
+    //    maximumAge:60000 means "use cached GPS if it's < 60 s old", which is instant.
+    //    Falls back gracefully (no-op) if GPS was denied or unavailable.
+    if (typeof navigator !== "undefined" && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => { /* silently ignore — GPS denied or unavailable */ },
+        { maximumAge: 60_000, timeout: 5_000, enableHighAccuracy: false }
+      );
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync search input with URL

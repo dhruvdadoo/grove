@@ -26,6 +26,8 @@ export interface Restaurant {
   isHawkerCentre?: boolean;
   /** True if sourced from Reddit but NOT found on Google Maps */
   isRedditGem?: boolean;
+  /** True if sourced from a food blog but NOT found on Google Maps */
+  isBlogPick?: boolean;
   /** URL to the source (Reddit thread, blog post) */
   sourceUrl?: string;
   /** Full formatted address (before stripping city name) */
