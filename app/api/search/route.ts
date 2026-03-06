@@ -149,6 +149,7 @@ async function fetchMapsPlaces(
 
   if (userLat !== undefined && userLng !== undefined) {
     // GPS available: try expanding radius until ≥ MIN_RESULTS
+    // NOTE: locationRestriction only accepts rectangle; circles must use locationBias
     for (const radius of GPS_RADII) {
       console.log(`[grove] Maps search radius: ${radius}m, query: "${textQuery}"`);
       const res = await fetch(mapsUrl, {
@@ -156,9 +157,9 @@ async function fetchMapsPlaces(
         headers,
         body: JSON.stringify({
           textQuery,
-          languageCode:        "en",
-          maxResultCount:      20,
-          locationRestriction: {
+          languageCode:   "en",
+          maxResultCount: 20,
+          locationBias: {
             circle: {
               center: { latitude: userLat, longitude: userLng },
               radius: radius,
